@@ -1,0 +1,403 @@
+#!/usr/bin/env python3
+"""Avoid harmful context compaction by maintaining durable task handoffs."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+
+DEFAULT_WARN = 0.75
+DEFAULT_HANDOFF = 0.85
+DEFAULT_STALE_SECONDS = 300
+DATA_DIR_NAME = ".avoid-context-compaction"
+LEGACY_DATA_DIR_NAME = ".context-guard"
+REQUIRED = ("task", "goal", "requirements", "completed", "verification", "decisions", "remaining", "next_steps", "cautions", "workspace", "status")
+LIST_FIELDS = ("requirements", "completed", "verification", "decisions", "remaining", "next_steps", "cautions", "workspace")
+SECRET_RE = re.compile(r"(?i)(api[_-]?key|access[_-]?token|password|secret)\s*[:=]\s*[^\s,;]+")
+
+
+def configure_stdio() -> None:
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            reconfigure(encoding="utf-8", errors="replace")
+
+
+def utcnow() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def parse_time(value: Any) -> dt.datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def safe_id(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip(".-")
+    return cleaned or "unknown-session"
+
+
+def session_id(explicit: str | None = None) -> str | None:
+    return explicit or os.environ.get("CODEX_THREAD_ID") or os.environ.get("CODEX_SESSION_ID")
+
+
+def codex_home(explicit: str | None = None) -> Path:
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    configured = os.environ.get("CODEX_HOME")
+    return Path(configured).expanduser().resolve() if configured else (Path.home() / ".codex").resolve()
+
+
+def find_transcript(home: Path, sid: str) -> Path | None:
+    matches: list[Path] = []
+    for root_name in ("sessions", "archived_sessions"):
+        root = home / root_name
+        if root.exists():
+            matches.extend(root.rglob(f"*{sid}*.jsonl"))
+    if not matches:
+        return None
+    exact = [p for p in matches if sid in p.stem]
+    return max(exact or matches, key=lambda p: p.stat().st_mtime)
+
+
+def is_compaction_event(record: dict[str, Any]) -> bool:
+    top = str(record.get("type", "")).lower()
+    payload = record.get("payload")
+    inner = str(payload.get("type", "")).lower() if isinstance(payload, dict) else ""
+    known = {"compacted", "compaction", "context_compacted", "thread_compacted"}
+    return top in known or inner in known
+
+
+def read_usage(transcript: Path, warn: float, handoff: float, stale_seconds: int) -> dict[str, Any]:
+    latest: dict[str, Any] | None = None
+    latest_line = 0
+    last_compaction_line = 0
+    parse_errors = 0
+    with transcript.open("r", encoding="utf-8", errors="replace") as handle:
+        for line_no, line in enumerate(handle, 1):
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                parse_errors += 1
+                continue
+            if not isinstance(record, dict):
+                continue
+            if is_compaction_event(record):
+                last_compaction_line = line_no
+            payload = record.get("payload")
+            if record.get("type") == "event_msg" and isinstance(payload, dict) and payload.get("type") == "token_count":
+                info = payload.get("info")
+                if isinstance(info, dict) and isinstance(info.get("last_token_usage"), dict):
+                    latest = {"timestamp": record.get("timestamp"), "info": info}
+                    latest_line = line_no
+
+    base = {
+        "session_id": None,
+        "transcript": str(transcript),
+        "snapshot_time": None,
+        "age_seconds": None,
+        "input_tokens": None,
+        "output_tokens": None,
+        "context_window": None,
+        "input_ratio": None,
+        "conservative_ratio": None,
+        "level": "unknown",
+        "reason": None,
+        "parse_errors": parse_errors,
+    }
+    if latest is None:
+        base["reason"] = "no supported token_count snapshot"
+        return base
+    if latest_line < last_compaction_line:
+        base["reason"] = "latest snapshot predates compaction"
+        return base
+
+    usage = latest["info"]["last_token_usage"]
+    window = latest["info"].get("model_context_window")
+    inputs = usage.get("input_tokens")
+    outputs = usage.get("output_tokens", 0)
+    if not isinstance(inputs, int) or not isinstance(outputs, int) or not isinstance(window, int) or window <= 0:
+        base["reason"] = "unsupported token_count fields"
+        return base
+
+    stamp = parse_time(latest.get("timestamp"))
+    age = max(0, int((utcnow() - stamp).total_seconds())) if stamp else None
+    conservative = (inputs + outputs) / window
+    level = "handoff" if conservative >= handoff else "warning" if conservative >= warn else "ok"
+    if age is None or age > stale_seconds:
+        level = "stale"
+    base.update(
+        snapshot_time=latest.get("timestamp"),
+        age_seconds=age,
+        input_tokens=inputs,
+        output_tokens=outputs,
+        context_window=window,
+        input_ratio=inputs / window,
+        conservative_ratio=conservative,
+        level=level,
+        reason="snapshot is older than configured freshness limit" if level == "stale" else None,
+    )
+    return base
+
+
+def usage_status(args: argparse.Namespace, transcript_override: str | None = None, sid_override: str | None = None) -> dict[str, Any]:
+    sid = session_id(sid_override or args.session_id)
+    transcript = Path(transcript_override or args.transcript).resolve() if (transcript_override or args.transcript) else None
+    if transcript is None and sid:
+        transcript = find_transcript(codex_home(args.codex_home), sid)
+    if transcript is None or not transcript.exists():
+        return {"session_id": sid, "level": "unknown", "reason": "matching transcript not found", "transcript": str(transcript) if transcript else None}
+    result = read_usage(transcript, args.warn, args.handoff, args.stale_seconds)
+    result["session_id"] = sid
+    return result
+
+
+def atomic_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(value, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+        os.replace(temp_name, path)
+    finally:
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
+
+
+def atomic_text(path: Path, value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(value)
+        os.replace(temp_name, path)
+    finally:
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
+
+
+def validate_checkpoint(data: Any) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        raise ValueError("checkpoint must be a JSON object")
+    missing = [key for key in REQUIRED if key not in data]
+    if missing:
+        raise ValueError("missing fields: " + ", ".join(missing))
+    if not isinstance(data["task"], str) or not data["task"].strip():
+        raise ValueError("task must be a non-empty string")
+    if not isinstance(data["goal"], str) or not data["goal"].strip():
+        raise ValueError("goal must be a non-empty string")
+    for key in LIST_FIELDS:
+        if not isinstance(data[key], list) or any(not isinstance(item, str) for item in data[key]):
+            raise ValueError(f"{key} must be a list of strings")
+    if data["status"] not in {"active", "ready", "complete"}:
+        raise ValueError("status must be active, ready, or complete")
+    rendered = json.dumps(data, ensure_ascii=False)
+    if SECRET_RE.search(rendered):
+        raise ValueError("checkpoint appears to contain a secret; remove the secret value")
+    return data
+
+
+def section(title: str, items: list[str]) -> str:
+    body = "\n".join(f"- {item}" for item in items) if items else "- 无"
+    return f"## {title}\n\n{body}\n"
+
+
+def render_handoff(data: dict[str, Any], meta: dict[str, Any]) -> str:
+    usage = meta.get("usage", {})
+    usage_line = "不可用"
+    if isinstance(usage.get("conservative_ratio"), float):
+        usage_line = f"{usage['conservative_ratio']:.1%}（最近快照，级别：{usage.get('level')}）"
+    parts = [
+        f"# {data['task']} — 任务交接\n",
+        f"- 保存时间：{meta['saved_at']}\n- 会话 ID：{meta['session_id']}\n- 项目：{meta['project']}\n- 状态：{data['status']}\n- 上下文用量：{usage_line}\n",
+        f"## 目标与完成标准\n\n{data['goal']}\n",
+        section("用户要求与纠正", data["requirements"]),
+        section("已完成成果", data["completed"]),
+        section("验证证据", data["verification"]),
+        section("决定及原因", data["decisions"]),
+        section("未完成工作与阻塞", data["remaining"]),
+        section("下一步", data["next_steps"]),
+        section("注意事项与权限边界", data["cautions"]),
+        section("工作区与运行状态", data["workspace"]),
+    ]
+    return "\n".join(parts).rstrip() + "\n"
+
+
+def checkpoint(args: argparse.Namespace) -> int:
+    source = Path(args.input).resolve()
+    data = validate_checkpoint(json.loads(source.read_text(encoding="utf-8-sig")))
+    project = Path(args.project).resolve()
+    sid = safe_id(session_id(args.session_id) or "manual")
+    stamp = utcnow().strftime("%Y%m%dT%H%M%SZ")
+    base = project / DATA_DIR_NAME / sid
+    generation = base / stamp
+    suffix = 1
+    while generation.exists():
+        generation = base / f"{stamp}-{suffix}"
+        suffix += 1
+    generation.mkdir(parents=True)
+    usage = usage_status(args)
+    meta = {"saved_at": utcnow().isoformat(), "session_id": sid, "project": str(project), "usage": usage}
+    handoff = render_handoff(data, meta)
+    handoff_path = generation / "HANDOFF.md"
+    resume_path = generation / "RESUME.txt"
+    checkpoint_path = generation / "checkpoint.json"
+    resume = (
+        f"继续项目“{project}”中的任务“{data['task']}”。\n\n"
+        f"先完整读取交接文件：{handoff_path}\n"
+        "再读取适用的 AGENTS.md，并核对实际文件、工作区状态和验证证据。\n"
+        "保留交接中的用户要求、纠正和决定理由；区分已验证事实、未验证修改与假设。\n"
+        "如记录与实际状态不一致，先说明并核实差异，然后从“下一步”继续完成任务。\n"
+    )
+    atomic_json(checkpoint_path, {"meta": meta, "checkpoint": data})
+    atomic_text(handoff_path, handoff)
+    atomic_text(resume_path, resume)
+    atomic_json(base / "current.json", {"generation": generation.name, "handoff": str(handoff_path), "resume": str(resume_path), "saved_at": meta["saved_at"]})
+    print(json.dumps({"handoff": str(handoff_path), "resume": str(resume_path), "checkpoint": str(checkpoint_path)}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def load_current_handoff(project: Path, sid: str) -> tuple[Path | None, str | None]:
+    for directory in (DATA_DIR_NAME, LEGACY_DATA_DIR_NAME):
+        pointer = project / directory / safe_id(sid) / "current.json"
+        if not pointer.exists():
+            continue
+        try:
+            path = Path(json.loads(pointer.read_text(encoding="utf-8"))["handoff"])
+            return (path, path.read_text(encoding="utf-8")) if path.exists() else (path, None)
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+            return pointer, None
+    return None, None
+
+
+def runtime_state_path(home: Path, sid: str) -> Path:
+    return home / ".avoid-context-compaction-runtime" / f"{safe_id(sid)}.json"
+
+
+def should_notify(result: dict[str, Any], state_path: Path) -> bool:
+    level = result.get("level")
+    if level not in {"warning", "handoff"}:
+        if state_path.exists():
+            atomic_json(state_path, {"level": level, "ratio": result.get("conservative_ratio"), "updated_at": utcnow().isoformat()})
+        return False
+    previous: dict[str, Any] = {}
+    try:
+        previous = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        pass
+    ratio = float(result.get("conservative_ratio") or 0)
+    notify = previous.get("level") != level or ratio >= float(previous.get("ratio") or 0) + 0.05
+    if notify:
+        atomic_json(state_path, {"level": level, "ratio": ratio, "updated_at": utcnow().isoformat()})
+    return notify
+
+
+def hook_output(event: str, message: str, context: str | None = None) -> None:
+    payload: dict[str, Any] = {"continue": True, "systemMessage": message}
+    if context and event in {"SessionStart", "UserPromptSubmit", "PostToolUse"}:
+        payload["hookSpecificOutput"] = {"hookEventName": event, "additionalContext": context}
+    print(json.dumps(payload, ensure_ascii=False))
+
+
+def hook(args: argparse.Namespace) -> int:
+    try:
+        incoming = json.load(sys.stdin)
+    except json.JSONDecodeError:
+        return 0
+    event = str(incoming.get("hook_event_name", ""))
+    sid = str(incoming.get("session_id") or session_id(args.session_id) or "unknown-session")
+    project = Path(incoming.get("cwd") or os.getcwd()).resolve()
+    transcript = incoming.get("transcript_path")
+
+    if event == "SessionStart":
+        handoff_path, handoff = load_current_handoff(project, sid)
+        if handoff:
+            compact_note = "本会话刚发生上下文压缩。" if incoming.get("source") == "compact" else "检测到本会话已有交接记录。"
+            context = f"Avoid Context Compaction：{compact_note}先核对实际状态，再继续。\n交接文件：{handoff_path}\n\n{handoff}"
+            hook_output(event, "Avoid Context Compaction 已载入当前会话的交接记录。", context[:12000])
+        return 0
+
+    if event == "PreCompact":
+        marker = project / DATA_DIR_NAME / safe_id(sid) / f"precompact-{utcnow().strftime('%Y%m%dT%H%M%SZ')}.json"
+        atomic_json(marker, {"event": "PreCompact", "trigger": incoming.get("trigger"), "time": utcnow().isoformat(), "transcript": transcript})
+        current_path, current = load_current_handoff(project, sid)
+        note = f"Avoid Context Compaction 已记录压缩事件：{marker}。"
+        if not current:
+            note += " 当前没有结构化交接文档；压缩后应先核对日志和实际文件并立即补建。"
+        else:
+            note += f" 压缩后请从 {current_path} 恢复。"
+        hook_output(event, note)
+        return 0
+
+    if event not in {"UserPromptSubmit", "PostToolUse"}:
+        return 0
+    result = usage_status(args, transcript_override=transcript, sid_override=sid)
+    state_path = runtime_state_path(codex_home(args.codex_home), sid)
+    if not should_notify(result, state_path):
+        return 0
+    ratio = result["conservative_ratio"]
+    if result["level"] == "handoff":
+        message = f"Avoid Context Compaction：最近用量快照约为上下文窗口的 {ratio:.1%}，已到交接线。"
+        context = (
+            "在下一个安全节点使用 avoid-context-compaction 生成或更新结构化交接文档；完成眼前可快速完成的动作，"
+            "不要再开始大阶段。向用户提供 HANDOFF.md 路径和 RESUME.txt 的完整指令，并建议新开任务。"
+        )
+    else:
+        message = f"Avoid Context Compaction：最近用量快照约为上下文窗口的 {ratio:.1%}，请在安全节点更新检查点。"
+        context = "在下一个安全节点更新 avoid-context-compaction 检查点，准确记录用户纠正、成果、验证、决定理由和下一步。"
+    hook_output(event, message, context)
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--codex-home")
+    parser.add_argument("--session-id")
+    parser.add_argument("--transcript")
+    parser.add_argument("--warn", type=float, default=DEFAULT_WARN)
+    parser.add_argument("--handoff", type=float, default=DEFAULT_HANDOFF)
+    parser.add_argument("--stale-seconds", type=int, default=DEFAULT_STALE_SECONDS)
+    sub = parser.add_subparsers(dest="command", required=True)
+    status_parser = sub.add_parser("status")
+    status_parser.add_argument("--json", action="store_true")
+    cp = sub.add_parser("checkpoint")
+    cp.add_argument("--input", required=True)
+    cp.add_argument("--project", required=True)
+    sub.add_parser("hook")
+    return parser
+
+
+def main() -> int:
+    configure_stdio()
+    args = build_parser().parse_args()
+    if not 0 < args.warn < args.handoff < 1:
+        print("thresholds must satisfy 0 < warn < handoff < 1", file=sys.stderr)
+        return 2
+    try:
+        if args.command == "status":
+            result = usage_status(args)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0 if result.get("level") != "unknown" else 1
+        if args.command == "checkpoint":
+            return checkpoint(args)
+        return hook(args)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"avoid-context-compaction: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
