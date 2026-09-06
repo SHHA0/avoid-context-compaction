@@ -93,11 +93,15 @@ class ContextGuardTests(unittest.TestCase):
             (home / "hooks.json").write_text(json.dumps(hooks), encoding="utf-8")
             install_command = [sys.executable, str(INSTALLER), "--codex-home", str(home)]
             subprocess.run(install_command, check=True, capture_output=True, text=True)
+            installed = home / "skills" / "avoid-context-compaction"
+            (installed / "obsolete.txt").write_text("old install artifact", encoding="utf-8")
             subprocess.run(install_command, check=True, capture_output=True, text=True)
             merged = json.loads((home / "hooks.json").read_text(encoding="utf-8"))
             self.assertEqual(sum(isinstance(g, dict) and any("avoid_context_compaction.py" in str(h) for h in g.get("hooks", [])) for g in merged["hooks"]["SessionStart"]), 1)
             self.assertTrue(any(h.get("command") == "existing-tool" for g in merged["hooks"]["SessionStart"] for h in g.get("hooks", [])))
-            self.assertTrue((home / "skills" / "avoid-context-compaction" / "SKILL.md").exists())
+            self.assertTrue((installed / "SKILL.md").exists())
+            self.assertFalse((installed / ".git").exists())
+            self.assertFalse((installed / "obsolete.txt").exists())
 
 
 if __name__ == "__main__":

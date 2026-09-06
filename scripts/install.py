@@ -7,12 +7,14 @@ import argparse
 import json
 import os
 import shutil
+import stat
 import sys
 import tempfile
 from pathlib import Path
 
 
 EVENTS = ("SessionStart", "UserPromptSubmit", "PostToolUse", "PreCompact")
+INSTALL_IGNORES = (".git", ".avoid-context-compaction", ".context-guard", "__pycache__", "*.pyc")
 
 
 def atomic_json(path: Path, value: object) -> None:
@@ -38,6 +40,12 @@ def is_managed_group(group: object) -> bool:
     return False
 
 
+def remove_readonly(function, path: str, _exc_info: object) -> None:
+    """Allow upgrades to remove read-only files copied by older installers."""
+    os.chmod(path, stat.S_IWRITE)
+    function(path)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--codex-home", default=os.environ.get("CODEX_HOME") or str(Path.home() / ".codex"))
@@ -60,7 +68,13 @@ def main() -> int:
         groups.extend(template["hooks"][event])
 
     target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(source, target, dirs_exist_ok=True, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    if source != target:
+        skills_root = (home / "skills").resolve()
+        if target.resolve().parent != skills_root:
+            raise ValueError(f"refusing to replace unexpected install path: {target}")
+        if target.exists():
+            shutil.rmtree(target, onerror=remove_readonly)
+        shutil.copytree(source, target, ignore=shutil.ignore_patterns(*INSTALL_IGNORES))
     installed_script = target / "scripts" / "avoid_context_compaction.py"
     command = f'"{Path(sys.executable).resolve()}" "{installed_script}" hook'
     for event in EVENTS:
