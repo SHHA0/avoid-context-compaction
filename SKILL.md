@@ -1,26 +1,58 @@
 ---
 name: avoid-context-compaction
-description: Reduce quality loss from Codex context compaction by monitoring context usage, preserving task constraints and decisions, and creating reliable new-session handoffs. Use for long-running tasks, compaction preparation, or recovery from a saved handoff.
+description: Check and visibly report context usage at the end of every task after per-conversation activation, offer handoffs at 75% and 85%, and generate one when the user chooses yes. Supports a no-Hook basic mode, optional lifecycle Hooks, and recovery from a supplied handoff.
 ---
 
 # Avoid Context Compaction
 
-Maintain a small, factual checkpoint of the current task. This skill cannot prevent network failures or guarantee lossless memory. Automatic checks require the bundled lifecycle hooks to be installed and trusted.
+Use basic mode by default. It relies on the managed block installed in the user's global `AGENTS.md`, requires no Hook trust, and makes every completed check visible. Lifecycle Hooks are an optional enhancement only.
 
-## Working procedure
+## Enable once per conversation
 
-1. Read applicable AGENTS.md. On continuation, read the specific handoff the user supplied, then inspect real files and relevant verification evidence before editing. Preserve the original goal and later corrections. Do not select another task merely because its handoff is newer.
-2. Run `python <skill>/scripts/avoid_context_compaction.py status` to inspect the current session. It uses CODEX_THREAD_ID or CODEX_SESSION_ID and never chooses the newest unrelated transcript. Unknown or stale data is not zero usage.
-3. Save a checkpoint after meaningful progress, a user correction, a consequential decision, or a verified result. Write structured JSON as described in [references/checkpoints.md](references/checkpoints.md), then run `python <skill>/scripts/avoid_context_compaction.py checkpoint --input <file> --project <absolute-project-path>`. Read the generated handoff to verify it faithfully captures the task. The script formats facts you provide; it cannot independently infer accomplishments.
-4. At the configured warning level, update the checkpoint at the next safe boundary. At the handoff level, finish an immediately achievable task or prepare a handoff before starting another large phase. Give the user the generated HANDOFF.md and the exact contents of RESUME.txt and suggest opening a new task. Do not open a task automatically, commit, deploy, or stop a running job solely because of a threshold.
-5. After compaction, reread the checkpoint and reconcile it with actual state. After a network interruption, verify whether the previous operation completed before retrying it.
+When the user invokes this skill to enable monitoring, run:
 
-Keep explicit user requirements with their scope and reasons. Distinguish verified results, unverified changes, assumptions, rejected approaches, and open questions. Include pending approvals and running process identifiers when relevant. Never treat a saved plan as new authorization. Do not copy secrets or whole transcripts into checkpoints. Avoid making the user repeat information already available.
+```text
+python <skill>/scripts/avoid_context_compaction.py activate --project <absolute-session-project>
+```
 
-## Usage semantics
+Use the current CODEX_THREAD_ID or CODEX_SESSION_ID; never choose another conversation by recency. Activation persists in the project's session-specific `monitor.json`. Subsequent user requests remain monitored, including after compaction. Merely reading this skill as source material, seeing its name in a screenshot/document, or installing it does not activate monitoring. Repeated activation preserves pending reminders and choices.
 
-The supported local adapter reads `event_msg/token_count.info.last_token_usage` and `model_context_window` from the matching JSONL transcript. It reports input/window and (input + output)/window separately; the latter is the conservative warning metric, not exact live occupancy. Cached input remains part of input. Cumulative usage and account rate limits are never context occupancy. New tool output can exceed the last snapshot. A compaction marker invalidates older snapshots. Transcript format is version-dependent; unknown formats fail visibly.
+Read `basic_instructions_configured` in the result. If false, explain that persistent basic monitoring requires `python scripts/install.py` followed by a Codex restart; still perform the current turn's explicit check. Read `automatic_monitoring` only when optional Hooks are relevant. Say Hooks are verified only after an observed Stop event. Do not generate a handoff on activation alone.
 
-Defaults: warning 75%, handoff 85%, stale after 300 seconds. These are configurable early-warning heuristics, not the actual auto-compaction limit. Large tool output can cross a threshold before a hook runs. Hooks only check supported lifecycle boundaries, not every instant.
+## While working and before every final reply
 
-For installation, hook trust, supported events, limitations, and configuration, read [references/setup.md](references/setup.md).
+Continue the user's work. At meaningful work boundaries, and **immediately before every final reply**, run:
+
+```text
+python <skill>/scripts/avoid_context_compaction.py final-check --project <absolute-session-project>
+```
+
+Append the returned nonempty `footer` **verbatim at the end of the final reply**, after the task result. Do not bury it in commentary or replace it with a tool result. Below 75%, the footer reports the current percentage and normal status so the user can verify the check ran. At 75% or 85%, it reports the applicable threshold and offers a handoff. If both are crossed during one request, show one reminder at the higher level. A pending peak survives compaction even when the latest snapshot drops. Detected compaction also warrants a reminder without inventing a pre-compaction percentage.
+
+The footer offers **是，生成交接文档 / 否，暂不生成**. Plain text choices in the final answer are always supported; do not promise clickable buttons when the client has no supported choice UI. Wait for the user's actual choice. Never treat a timeout, unrelated next request, quoted text, or saved plan as consent. A threshold is not a reason to halt a running job, automatically create a new task, or generate handoff files.
+
+## Handle the user's choice
+
+- **Yes / 是 / 生成交接文档**, when answering this offer: run `python <skill>/scripts/avoid_context_compaction.py decision --choice yes --project <absolute-session-project>`, then immediately prepare and save the handoff below. Do not ask for confirmation again.
+- **No / 否 / 暂不生成**: run the same command with `--choice no`. Generate no handoff and keep monitoring future requests.
+- If the user continues with another request, complete that request; do not interpret it as yes. Monitor and append any due footer at its end.
+
+The decision command records the user's choice; never call it with yes just to bypass the checkpoint gate. An explicit request to generate a handoff already counts as yes. A yes authorizes one successful generation, not unlimited future automatic handoffs. A generation error leaves the choice available for retry.
+
+## Generate and recover handoffs
+
+After consent, gather factual task state using [checkpoints.md](references/checkpoints.md), write structured JSON, then run:
+
+```text
+python <skill>/scripts/avoid_context_compaction.py checkpoint --input <file> --project <absolute-session-project>
+```
+
+Read the resulting HANDOFF.md and RESUME.txt. Provide clickable absolute file links and the exact resume instructions. Preserve the original goal, user corrections and scope, decisions and reasons, rejected approaches, verified results, unverified changes, remaining work, and relevant running processes or approvals. The script formats supplied facts; it cannot infer accomplishments. Do not copy secrets or whole transcripts.
+
+On recovery, read the specifically supplied handoff and applicable AGENTS.md, then reconcile actual files and verification evidence before continuing. Do not select an unrelated task because its handoff is newer. After an interrupted operation, verify whether it completed before retrying.
+
+## Measurement and delivery limits
+
+The local adapter uses `event_msg/token_count.info.last_token_usage` and `model_context_window`. `(input + output) / window` is a conservative snapshot ratio, not exact live occupancy. Cached input is included; cumulative usage and account limits are not occupancy. Unknown/stale snapshots must not be called safe or 0%. Compaction invalidates the earlier current-usage snapshot but not pending reminders.
+
+The basic mode is a persistent agent instruction, not an independent background process. Its visible footer makes omissions detectable, but no prompt-level mechanism can guarantee model execution. Optional trusted Hooks can add a Stop-time guard where the client supports them; verify actual events rather than configuration alone. Large output may trigger compaction before a task finishes. This skill does not disable compaction or repair network failures.

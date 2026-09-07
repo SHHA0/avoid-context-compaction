@@ -1,6 +1,6 @@
 interface:
   display_name: "Avoid Context Compaction"
-  short_description: "Warn before compaction and create durable task handoffs"
-  default_prompt: "Use $avoid-context-compaction to check context usage and preserve a reliable handoff for this task."
+  short_description: "Report context after every task and offer handoffs"
+  default_prompt: "Use $avoid-context-compaction to enable basic monitoring in this conversation, report usage after every task, and generate a handoff only when I choose yes."
 policy:
   allow_implicit_invocation: true

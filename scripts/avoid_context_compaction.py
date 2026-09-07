@@ -39,7 +39,8 @@ def parse_time(value: Any) -> dt.datetime | None:
     if not isinstance(value, str):
         return None
     try:
-        return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        stamp = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return stamp if stamp.tzinfo else None
     except ValueError:
         return None
 
@@ -65,7 +66,7 @@ def find_transcript(home: Path, sid: str) -> Path | None:
     for root_name in ("sessions", "archived_sessions"):
         root = home / root_name
         if root.exists():
-            matches.extend(root.rglob(f"*{sid}*.jsonl"))
+            matches.extend(p for p in root.rglob("*.jsonl") if p.stem == sid or p.stem.endswith("-" + sid))
     if not matches:
         return None
     exact = [p for p in matches if sid in p.stem]
@@ -128,7 +129,7 @@ def read_usage(transcript: Path, warn: float, handoff: float, stale_seconds: int
     window = latest["info"].get("model_context_window")
     inputs = usage.get("input_tokens")
     outputs = usage.get("output_tokens", 0)
-    if not isinstance(inputs, int) or not isinstance(outputs, int) or not isinstance(window, int) or window <= 0:
+    if any(type(n) is not int or n < 0 for n in (inputs, outputs, window)) or window == 0:
         base["reason"] = "unsupported token_count fields"
         return base
 
@@ -237,8 +238,17 @@ def render_handoff(data: dict[str, Any], meta: dict[str, Any]) -> str:
 
 
 def checkpoint(args: argparse.Namespace) -> int:
+    import monitor
+    monitor_path = monitor.state_path(args.project, session_id(args.session_id) or "manual")
+    with monitor.locked(monitor_path):
+        return save_checkpoint(args, monitor_path, monitor.load(monitor_path))
+
+
+def save_checkpoint(args: argparse.Namespace, monitor_path: Path, monitor_state: dict[str, Any]) -> int:
     source = Path(args.input).resolve()
     data = validate_checkpoint(json.loads(source.read_text(encoding="utf-8-sig")))
+    if monitor_state.get("enabled") and not monitor_state.get("approved"):
+        raise ValueError("user choice required: after the user agrees, run decision --choice yes before checkpoint")
     project = Path(args.project).resolve()
     sid = safe_id(session_id(args.session_id) or "manual")
     stamp = utcnow().strftime("%Y%m%dT%H%M%SZ")
@@ -266,6 +276,9 @@ def checkpoint(args: argparse.Namespace) -> int:
     atomic_text(handoff_path, handoff)
     atomic_text(resume_path, resume)
     atomic_json(base / "current.json", {"generation": generation.name, "handoff": str(handoff_path), "resume": str(resume_path), "saved_at": meta["saved_at"]})
+    if monitor_state.get("enabled"):
+        monitor_state.update(approved=False, suppress_turn=True, pending_peak=0, pending_compaction=False)
+        atomic_json(monitor_path, monitor_state)
     print(json.dumps({"handoff": str(handoff_path), "resume": str(resume_path), "checkpoint": str(checkpoint_path)}, ensure_ascii=False, indent=2))
     return 0
 
@@ -283,83 +296,9 @@ def load_current_handoff(project: Path, sid: str) -> tuple[Path | None, str | No
     return None, None
 
 
-def runtime_state_path(home: Path, sid: str) -> Path:
-    return home / ".avoid-context-compaction-runtime" / f"{safe_id(sid)}.json"
-
-
-def should_notify(result: dict[str, Any], state_path: Path) -> bool:
-    level = result.get("level")
-    if level not in {"warning", "handoff"}:
-        if state_path.exists():
-            atomic_json(state_path, {"level": level, "ratio": result.get("conservative_ratio"), "updated_at": utcnow().isoformat()})
-        return False
-    previous: dict[str, Any] = {}
-    try:
-        previous = json.loads(state_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        pass
-    ratio = float(result.get("conservative_ratio") or 0)
-    notify = previous.get("level") != level or ratio >= float(previous.get("ratio") or 0) + 0.05
-    if notify:
-        atomic_json(state_path, {"level": level, "ratio": ratio, "updated_at": utcnow().isoformat()})
-    return notify
-
-
-def hook_output(event: str, message: str, context: str | None = None) -> None:
-    payload: dict[str, Any] = {"continue": True, "systemMessage": message}
-    if context and event in {"SessionStart", "UserPromptSubmit", "PostToolUse"}:
-        payload["hookSpecificOutput"] = {"hookEventName": event, "additionalContext": context}
-    print(json.dumps(payload, ensure_ascii=False))
-
-
 def hook(args: argparse.Namespace) -> int:
-    try:
-        incoming = json.load(sys.stdin)
-    except json.JSONDecodeError:
-        return 0
-    event = str(incoming.get("hook_event_name", ""))
-    sid = str(incoming.get("session_id") or session_id(args.session_id) or "unknown-session")
-    project = Path(incoming.get("cwd") or os.getcwd()).resolve()
-    transcript = incoming.get("transcript_path")
-
-    if event == "SessionStart":
-        handoff_path, handoff = load_current_handoff(project, sid)
-        if handoff:
-            compact_note = "本会话刚发生上下文压缩。" if incoming.get("source") == "compact" else "检测到本会话已有交接记录。"
-            context = f"Avoid Context Compaction：{compact_note}先核对实际状态，再继续。\n交接文件：{handoff_path}\n\n{handoff}"
-            hook_output(event, "Avoid Context Compaction 已载入当前会话的交接记录。", context[:12000])
-        return 0
-
-    if event == "PreCompact":
-        marker = project / DATA_DIR_NAME / safe_id(sid) / f"precompact-{utcnow().strftime('%Y%m%dT%H%M%SZ')}.json"
-        atomic_json(marker, {"event": "PreCompact", "trigger": incoming.get("trigger"), "time": utcnow().isoformat(), "transcript": transcript})
-        current_path, current = load_current_handoff(project, sid)
-        note = f"Avoid Context Compaction 已记录压缩事件：{marker}。"
-        if not current:
-            note += " 当前没有结构化交接文档；压缩后应先核对日志和实际文件并立即补建。"
-        else:
-            note += f" 压缩后请从 {current_path} 恢复。"
-        hook_output(event, note)
-        return 0
-
-    if event not in {"UserPromptSubmit", "PostToolUse"}:
-        return 0
-    result = usage_status(args, transcript_override=transcript, sid_override=sid)
-    state_path = runtime_state_path(codex_home(args.codex_home), sid)
-    if not should_notify(result, state_path):
-        return 0
-    ratio = result["conservative_ratio"]
-    if result["level"] == "handoff":
-        message = f"Avoid Context Compaction：最近用量快照约为上下文窗口的 {ratio:.1%}，已到交接线。"
-        context = (
-            "在下一个安全节点使用 avoid-context-compaction 生成或更新结构化交接文档；完成眼前可快速完成的动作，"
-            "不要再开始大阶段。向用户提供 HANDOFF.md 路径和 RESUME.txt 的完整指令，并建议新开任务。"
-        )
-    else:
-        message = f"Avoid Context Compaction：最近用量快照约为上下文窗口的 {ratio:.1%}，请在安全节点更新检查点。"
-        context = "在下一个安全节点更新 avoid-context-compaction 检查点，准确记录用户纠正、成果、验证、决定理由和下一步。"
-    hook_output(event, message, context)
-    return 0
+    import monitor
+    return monitor.hook(args)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -377,6 +316,11 @@ def build_parser() -> argparse.ArgumentParser:
     cp.add_argument("--input", required=True)
     cp.add_argument("--project", required=True)
     sub.add_parser("hook")
+    for name in ("activate", "final-check", "decision", "doctor"):
+        command_parser = sub.add_parser(name)
+        command_parser.add_argument("--project", required=True)
+        if name == "decision":
+            command_parser.add_argument("--choice", choices=("yes", "no"), required=True)
     return parser
 
 
@@ -393,8 +337,15 @@ def main() -> int:
             return 0 if result.get("level") != "unknown" else 1
         if args.command == "checkpoint":
             return checkpoint(args)
-        return hook(args)
+        if args.command == "hook":
+            return hook(args)
+        import monitor
+        return monitor.command(args)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
+        if args.command == "hook":
+            # Stop exit code 2 means "continue the turn"; diagnostics must not loop.
+            print(json.dumps({"systemMessage": f"上下文监测失败，自动提醒尚未验证：{exc}"}, ensure_ascii=False))
+            return 0
         print(f"avoid-context-compaction: {exc}", file=sys.stderr)
         return 2
 

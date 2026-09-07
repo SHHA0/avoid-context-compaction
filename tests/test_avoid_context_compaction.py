@@ -88,10 +88,13 @@ class ContextGuardTests(unittest.TestCase):
             self.assertTrue(Path(second_result["resume"]).exists())
 
             home = root / "codex-home"
-            hooks = {"description": "existing", "hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "existing-tool"}]}]}}
+            hooks = {"description": "existing", "hooks": {"SessionStart": [{"hooks": [
+                {"type": "command", "command": "existing-tool"},
+                {"type": "command", "command": "python context_guard.py hook"}
+            ]}]}}
             home.mkdir()
             (home / "hooks.json").write_text(json.dumps(hooks), encoding="utf-8")
-            install_command = [sys.executable, str(INSTALLER), "--codex-home", str(home)]
+            install_command = [sys.executable, str(INSTALLER), "--codex-home", str(home), "--with-hooks"]
             subprocess.run(install_command, check=True, capture_output=True, text=True)
             installed = home / "skills" / "avoid-context-compaction"
             (installed / "obsolete.txt").write_text("old install artifact", encoding="utf-8")
@@ -102,6 +105,25 @@ class ContextGuardTests(unittest.TestCase):
             self.assertTrue((installed / "SKILL.md").exists())
             self.assertFalse((installed / ".git").exists())
             self.assertFalse((installed / "obsolete.txt").exists())
+            self.assertIn("Stop", merged["hooks"])
+            agents = (home / "AGENTS.md").read_text(encoding="utf-8")
+            self.assertEqual(agents.count("avoid-context-compaction:basic-monitor:begin"), 1)
+            self.assertIn("final-check", agents)
+
+    def test_basic_install_preserves_agents_and_does_not_create_hooks(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp) / "codex-home"
+            home.mkdir()
+            (home / "AGENTS.md").write_text("# Existing rule\n", encoding="utf-8")
+            command = [sys.executable, str(INSTALLER), "--codex-home", str(home)]
+            first = subprocess.run(command, check=True, capture_output=True, text=True)
+            subprocess.run(command, check=True, capture_output=True, text=True)
+            result = json.loads(first.stdout)
+            agents = (home / "AGENTS.md").read_text(encoding="utf-8")
+            self.assertIn("# Existing rule", agents)
+            self.assertEqual(agents.count("avoid-context-compaction:basic-monitor:begin"), 1)
+            self.assertFalse((home / "hooks.json").exists())
+            self.assertFalse(result["hook_trust_required"])
 
 
 if __name__ == "__main__":

@@ -1,5 +1,7 @@
 # Checkpoint input
 
+In a monitored session, generate these files only after the user chooses yes (or explicitly requests a handoff). Record that choice with `decision --choice yes --project <absolute-project>` first. Enabling the skill or reaching a threshold does not authorize a checkpoint. One successful generation consumes the recorded choice; failed attempts can be retried.
+
 Use a UTF-8 JSON object with these required fields:
 
 ```json
