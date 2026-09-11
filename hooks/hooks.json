@@ -28,6 +28,20 @@
         ]
       }
     ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"$CODEX_HOME/skills/avoid-context-compaction/scripts/avoid_context_compaction.py\" hook",
+            "commandWindows": "python \"%CODEX_HOME%\\skills\\avoid-context-compaction\\scripts\\avoid_context_compaction.py\" hook",
+            "timeout": 10,
+            "additionalContextLimit": 600
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "*",

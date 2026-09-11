@@ -15,7 +15,8 @@ Hooks add these guards:
 | Event | Enabled-session behavior |
 | --- | --- |
 | UserPromptSubmit | Reinject monitoring instructions on each request; retain unanswered offers. |
-| PostToolUse | Record threshold peaks quietly. |
+| PreToolUse | At 90%, deny new substantive tool calls while allowing monitor/decision/checkpoint control commands. |
+| PostToolUse | Record threshold peaks; at 90%, mark the completed tool as the safe stopping boundary and tell the agent to finalize. |
 | PreCompact | Persist a pending compaction reminder without blocking work. |
 | SessionStart | Restore monitoring instructions and the exact existing handoff path, if any. |
 | Stop | Check current/pending usage and final text; request one short continuation if the footer was missed. |
@@ -31,13 +32,14 @@ Run `python <skill>/scripts/avoid_context_compaction.py doctor --project <absolu
 - `missing_events` lists absent configured handlers, including Stop.
 - `observed_events` stores actual event timestamps received by this script for this enabled session.
 - `automatic_monitoring: unverified` means no Stop execution was observed. Configuration alone does not establish trust or runtime support.
+- `hard_stop_enforcement: unverified` means both PreToolUse and PostToolUse have not yet been observed; do not claim the 90% gate is active until this becomes `observed`.
 
 For basic-mode acceptance, activate in a conversation and complete two short requests. Each final answer should show a usage footer, and `final_check_count` should increase. For Hook acceptance, actual UserPromptSubmit/PostToolUse/Stop timestamps must advance. Synthetic tests validate code paths, not client delivery.
 
-Defaults: warn 0.75, handoff 0.85, stale after 300 seconds. Set global flags **before** the subcommand, e.g. `--warn 0.70 --handoff 0.82 final-check --project ...`. For automatic thresholds, use the same flags before `hook` in every installed handler. Keep manual and automatic settings consistent.
+Defaults: warn 0.75, handoff 0.85, hard stop 0.90, stale after 300 seconds. Set global flags **before** the subcommand, e.g. `--warn 0.70 --handoff 0.82 --stop 0.90 final-check --project ...`. For automatic thresholds, use the same flags before `hook` in every installed handler. Keep manual and automatic settings consistent.
 
 ## Limits
 
 The JSONL format is version-dependent. Incremental observation retains peaks since activation; incomplete lines are retried. Current usage uses the latest supported snapshot; stale or unknown data is reported in final replies. Monitoring stores metadata, not transcripts or inferred task facts. OS file locks serialize monitoring state writes.
 
-Hosted tools may bypass PostToolUse. Later checks can recover supported intermediate snapshots and compaction records from the transcript, but missing records cannot be reconstructed. Large output may cross both thresholds and compact before a final reply. The default policy finishes current work and then offers a handoff; it cannot guarantee that automatic compaction never happens during that work.
+Hosted tools may bypass PreToolUse or PostToolUse. Later checks can recover supported intermediate snapshots and compaction records from the transcript, but missing records cannot be reconstructed. A running tool cannot be interrupted or rolled back. Large output may cross multiple thresholds and compact before a hook boundary, so the 90% policy pauses at the next observed safe boundary rather than guaranteeing that automatic compaction never happens.

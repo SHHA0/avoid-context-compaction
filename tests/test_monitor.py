@@ -106,6 +106,13 @@ class MonitorTests(unittest.TestCase):
         self.assertIsNone(self.hook("Stop", last_assistant_message="done\n" + footer))
         self.assertTrue(self.state()["awaiting_choice"])
 
+    def test_normal_footer_snapshot_drift_does_not_extend_turn(self):
+        self.append(.30)
+        self.command("activate")
+        footer = self.command("final-check")["footer"]
+        self.append(.31)
+        self.assertIsNone(self.hook("Stop", last_assistant_message="done\n" + footer))
+
     def test_snapshot_drift_does_not_duplicate_reminder_but_escalation_does(self):
         self.append(.80)
         self.command("activate")
@@ -114,6 +121,31 @@ class MonitorTests(unittest.TestCase):
         self.assertIsNone(self.hook("Stop", last_assistant_message="done\n" + footer))
         self.append(.86)
         self.assertEqual(self.hook("Stop", last_assistant_message="done\n" + footer)["decision"], "block")
+
+    def test_hard_stop_after_tool_blocks_new_work_but_allows_control_commands(self):
+        self.append(.89)
+        self.command("activate")
+        self.append(.91)
+        signal = self.hook("PostToolUse", tool_name="Bash", tool_input={"command": "build"})
+        self.assertIn("90%", signal["hookSpecificOutput"]["additionalContext"])
+        self.assertTrue(self.state()["hard_stop_pending"])
+
+        reminder = self.command("final-check")["footer"]
+        self.assertIn("90% 硬停止线", reminder)
+        self.assertIn("当前任务已在安全边界暂停", reminder)
+        self.append(.92)
+        self.assertIsNone(self.hook("Stop", last_assistant_message="paused\n" + reminder))
+
+        blocked = self.hook("PreToolUse", tool_name="Bash", tool_input={"command": "run another task"})
+        self.assertEqual(blocked["hookSpecificOutput"]["permissionDecision"], "deny")
+        allowed = self.hook("PreToolUse", tool_name="Bash", tool_input={
+            "command": "python avoid_context_compaction.py final-check --project project"
+        })
+        self.assertIsNone(allowed)
+        self.assertEqual(self.command("doctor")["hard_stop_enforcement"], "observed")
+
+        self.command("decision", "--choice", "no")
+        self.assertFalse(self.state()["hard_stop_pending"])
 
     def test_manual_fallback_resumes_after_decline_on_next_user_message(self):
         self.append(.80)
@@ -206,6 +238,12 @@ class MonitorTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.command("final-check")
 
+    def test_primary_agent_id_does_not_suppress_enabled_session_hook(self):
+        self.append(.30)
+        self.command("activate")
+        self.assertIsNone(self.hook("PostToolUse", agent_id="primary-agent"))
+        self.assertIn("PostToolUse", self.state()["observed_events"])
+
     def test_doctor_requires_observed_stop_not_just_config(self):
         self.home.mkdir()
         template = Path(core.__file__).parents[1] / "hooks" / "hooks.json"
@@ -214,6 +252,7 @@ class MonitorTests(unittest.TestCase):
         result = self.command("activate")
         self.assertEqual(result["missing_events"], [])
         self.assertEqual(result["automatic_monitoring"], "unverified")
+        self.assertEqual(result["hard_stop_enforcement"], "unverified")
         self.hook("Stop", last_assistant_message="done")
         self.assertEqual(self.command("doctor")["automatic_monitoring"], "observed")
 

@@ -1,6 +1,6 @@
 ---
 name: avoid-context-compaction
-description: Check and visibly report context usage at the end of every task after per-conversation activation, offer handoffs at 75% and 85%, and generate one when the user chooses yes. Supports a no-Hook basic mode, optional lifecycle Hooks, and recovery from a supplied handoff.
+description: Check and visibly report context usage after per-conversation activation, offer handoffs at 75% and 85%, safely pause work at 90%, and generate one when the user chooses yes. Supports a no-Hook basic mode, optional lifecycle Hooks, and recovery from a supplied handoff.
 ---
 
 # Avoid Context Compaction
@@ -29,7 +29,7 @@ python <skill>/scripts/avoid_context_compaction.py final-check --project <absolu
 
 Append the returned nonempty `footer` **verbatim at the end of the final reply**, after the task result. Do not bury it in commentary or replace it with a tool result. Below 75%, the footer reports the current percentage and normal status so the user can verify the check ran. At 75% or 85%, it reports the applicable threshold and offers a handoff. If both are crossed during one request, show one reminder at the higher level. A pending peak survives compaction even when the latest snapshot drops. Detected compaction also warrants a reminder without inventing a pre-compaction percentage.
 
-The footer offers **是，生成交接文档 / 否，暂不生成**. Plain text choices in the final answer are always supported; do not promise clickable buttons when the client has no supported choice UI. Wait for the user's actual choice. Never treat a timeout, unrelated next request, quoted text, or saved plan as consent. A threshold is not a reason to halt a running job, automatically create a new task, or generate handoff files.
+The footer offers **是，生成交接文档 / 否，暂不生成**. Plain text choices in the final answer are always supported; do not promise clickable buttons when the client has no supported choice UI. Wait for the user's actual choice. Never treat a timeout, unrelated next request, quoted text, or saved plan as consent. The 75% and 85% thresholds do not halt work. At the 90% hard-stop threshold, finish only an already-started atomic step, pause the current task at the next safe boundary, report where work stopped, append the footer, and wait for the user's choice. Do not start another substantive step, automatically create a new task, or generate handoff files.
 
 ## Handle the user's choice
 
@@ -55,4 +55,4 @@ On recovery, read the specifically supplied handoff and applicable AGENTS.md, th
 
 The local adapter uses `event_msg/token_count.info.last_token_usage` and `model_context_window`. `(input + output) / window` is a conservative snapshot ratio, not exact live occupancy. Cached input is included; cumulative usage and account limits are not occupancy. Unknown/stale snapshots must not be called safe or 0%. Compaction invalidates the earlier current-usage snapshot but not pending reminders.
 
-The basic mode is a persistent agent instruction, not an independent background process. Its visible footer makes omissions detectable, but no prompt-level mechanism can guarantee model execution. Optional trusted Hooks can add a Stop-time guard where the client supports them; verify actual events rather than configuration alone. Large output may trigger compaction before a task finishes. This skill does not disable compaction or repair network failures.
+The basic mode is a persistent agent instruction, not an independent background process. Its visible footer makes omissions detectable, but no prompt-level mechanism can guarantee model execution. Optional trusted Hooks add a PostToolUse 90% stop signal and a PreToolUse gate against starting another substantive tool call, plus the Stop-time footer guard. Verify actual events rather than configuration alone. A running tool cannot be interrupted or rolled back, hosted tools may bypass lifecycle coverage, and a large output may trigger compaction before the next boundary. This skill does not disable compaction or repair network failures.

@@ -4,13 +4,14 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import time
 from pathlib import Path
 
 import avoid_context_compaction as core
 
 
-EVENTS = ("SessionStart", "UserPromptSubmit", "PostToolUse", "PreCompact", "Stop")
+EVENTS = ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PreCompact", "Stop")
 BASIC_BEGIN = "<!-- avoid-context-compaction:basic-monitor:begin -->"
 
 
@@ -63,7 +64,7 @@ def load(path):
 
 def remember(state, usage):
     ratio = usage.get("conservative_ratio")
-    if usage.get("level") in {"warning", "handoff"} and isinstance(ratio, (int, float)):
+    if usage.get("level") in {"warning", "handoff", "hard_stop"} and isinstance(ratio, (int, float)):
         state["pending_peak"] = max(state.get("pending_peak", 0), ratio)
 
 
@@ -115,6 +116,8 @@ def observe(state, args, transcript=None):
                         state["pending_peak"] = max(state.get("pending_peak", 0), ratio)
         state.update(transcript=name, offset=offset)
     remember(state, result)
+    if state.get("pending_peak", 0) >= args.stop:
+        state["hard_stop_pending"] = True
     return result
 
 
@@ -131,15 +134,18 @@ def footer(state, args):
         return f"上下文用量：约 {ratio:.1%}（正常，未达到 {args.warn:.0%} 提醒线）。"
     facts = []
     if peak:
-        threshold = args.handoff if peak >= args.handoff else args.warn
-        facts.append(f"自上次处理提醒以来的用量快照最高约 {peak:.1%}，已达到 {threshold:.0%} 提醒线")
+        threshold = args.stop if peak >= args.stop else args.handoff if peak >= args.handoff else args.warn
+        label = "硬停止线" if threshold == args.stop else "提醒线"
+        facts.append(f"自上次处理提醒以来的用量快照最高约 {peak:.1%}，已达到 {threshold:.0%} {label}")
     if compacted:
         facts.append("期间已发生上下文压缩")
     ratio = usage.get("conservative_ratio")
-    if usage.get("level") in {"ok", "warning", "handoff"} and ratio is not None:
+    if usage.get("level") in {"ok", "warning", "handoff", "hard_stop"} and ratio is not None:
         facts.append(f"最近快照约 {ratio:.1%}")
     else:
         facts.append("当前用量不可确认")
+    if state.get("hard_stop_pending"):
+        facts.append("当前任务已在安全边界暂停，不再开始新步骤")
     return "上下文提醒：" + "；".join(facts) + "。\n是否生成交接文档？请选择：是，生成交接文档 / 否，暂不生成。"
 
 
@@ -148,7 +154,8 @@ def instructions(state, args):
     return (
         "本会话已启用 avoid-context-compaction。继续完成用户工作；在每轮最终回复前运行 "
         f'python "{script}" final-check --project "{state["project"]}"，将返回的 footer 原文附在最终回复末尾。'
-        "仅因阈值不要中断工作、自动生成交接文档或自动新开任务。用户选择是后，运行 decision --choice yes，"
+        f"达到 {args.warn:.0%} 或 {args.handoff:.0%} 时继续完成当前工作；达到 {args.stop:.0%} 硬停止线时，只完成已开始的原子小步骤，"
+        "然后暂停当前任务、返回 footer 并等待用户选择；不要自动生成交接文档或自动新开任务。用户选择是后，运行 decision --choice yes，"
         "整理真实任务事实并运行 checkpoint；选择否则运行 decision --choice no，保持监测。"
     )
 
@@ -158,7 +165,19 @@ def delivered(state, args, message):
     ending = str(message or "").rstrip()
     expected = footer(state, args)
     if "是否生成交接文档" not in expected:
-        return bool(expected) and ending.endswith(expected)
+        if not expected:
+            return False
+        # The assistant's footer is measured immediately before its reply, while
+        # Stop observes again after that reply has added tokens.  Treat an older
+        # normal footer as delivered as long as its semantic level and configured
+        # warning threshold still match; requiring the newly calculated percentage
+        # would create a redundant correction turn after every ordinary response.
+        if expected.startswith("上下文用量：约 "):
+            normal = re.compile(
+                rf"上下文用量：约 \d+(?:\.\d+)?%（正常，未达到 {re.escape(f'{args.warn:.0%}')} 提醒线）。$"
+            )
+            return bool(normal.search(ending))
+        return ending.endswith(expected)
     choices = "是否生成交接文档？请选择：是，生成交接文档 / 否，暂不生成。"
     if not ending.endswith(choices):
         return False
@@ -168,8 +187,9 @@ def delivered(state, args, message):
     reminder = ending[start:]
     peak = state.get("pending_peak", 0)
     if peak:
-        threshold = args.handoff if peak >= args.handoff else args.warn
-        if f"{threshold:.0%} 提醒线" not in reminder:
+        threshold = args.stop if peak >= args.stop else args.handoff if peak >= args.handoff else args.warn
+        label = "硬停止线" if threshold == args.stop else "提醒线"
+        if f"{threshold:.0%} {label}" not in reminder:
             return False
     return not state.get("pending_compaction") or "已发生上下文压缩" in reminder
 
@@ -184,15 +204,22 @@ def health(args, state):
                 configured.append(event)
     agents_path = core.codex_home(args.codex_home) / "AGENTS.md"
     basic_configured = agents_path.exists() and BASIC_BEGIN in agents_path.read_text(encoding="utf-8-sig")
+    observed = state.get("observed_events", {})
     return {
         "basic_instructions_configured": basic_configured,
         "last_final_check": state.get("last_final_check"),
         "final_check_count": state.get("final_check_count", 0),
         "configured_events": configured,
         "missing_events": [e for e in EVENTS if e not in configured],
-        "observed_events": state.get("observed_events", {}),
-        "automatic_monitoring": "observed" if state.get("observed_events", {}).get("Stop") else "unverified",
-        "note": "Configuration alone does not prove hook trust or execution. Verify a real Stop event after restart; do not claim continuous monitoring before that.",
+        "observed_events": observed,
+        "automatic_monitoring": "observed" if observed.get("Stop") else "unverified",
+        "hard_stop_enforcement": (
+            "observed" if observed.get("PreToolUse") and observed.get("PostToolUse") else "unverified"
+        ),
+        "note": (
+            "Configuration alone does not prove hook trust or execution. Verify a real Stop event for automatic reminders "
+            "and real PreToolUse/PostToolUse events for 90% hard-stop enforcement after restart."
+        ),
     }
 
 
@@ -215,7 +242,8 @@ def command(args):
         elif args.command == "decision":
             observe(state, args)
             state.update(approved=args.choice == "yes", awaiting_choice=False, suppress_turn=True,
-                         pending_peak=0, pending_compaction=False)
+                         pending_peak=0, pending_compaction=False, hard_stop_pending=False,
+                         hard_stop_injected_turn=None)
             output = {"choice": args.choice, "generate_now": args.choice == "yes"}
         else:
             observe(state, args)
@@ -237,9 +265,13 @@ def hook(args):
         raise ValueError("hook input must be an object")
     event = incoming.get("hook_event_name")
     sid = incoming.get("session_id") or core.session_id(args.session_id)
-    if event not in EVENTS or not sid or incoming.get("agent_id"):
-        return 0
     project = Path(incoming.get("cwd") or os.getcwd()).resolve()
+    # Newer Codex clients may include ``agent_id`` for the primary agent too,
+    # so its presence is not a reliable sub-agent discriminator.  Session
+    # opt-in below is the isolation boundary: hooks remain silent unless this
+    # exact project/session already has an enabled monitor state.
+    if event not in EVENTS or not sid:
+        return 0
     path = state_path(project, sid)
     if not path.exists():
         return 0  # Installing hooks never opts other conversations in.
@@ -255,7 +287,42 @@ def hook(args):
             state["pending_compaction"] = True
         text = footer(state, args)
         output = None
-        if event == "Stop":
+        if event == "PreToolUse" and state.get("hard_stop_pending"):
+            tool_input = incoming.get("tool_input")
+            command = ""
+            if isinstance(tool_input, dict):
+                command = tool_input.get("command") or tool_input.get("cmd") or ""
+            allowed_control = (
+                isinstance(command, str)
+                and "avoid_context_compaction.py" in command
+                and any(re.search(rf"\b{name}\b", command) for name in ("final-check", "decision", "checkpoint"))
+            )
+            if not allowed_control:
+                output = {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": (
+                            f"上下文用量已达到 {args.stop:.0%} 硬停止线。当前小步骤已结束，"
+                            "不再开始新工具操作；请运行 final-check，说明停止位置并询问是否生成交接文档。"
+                        ),
+                    }
+                }
+        elif event == "PostToolUse" and state.get("hard_stop_pending"):
+            turn = incoming.get("turn_id")
+            if not turn or state.get("hard_stop_injected_turn") != turn:
+                state["hard_stop_injected_turn"] = turn
+                output = {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PostToolUse",
+                        "additionalContext": (
+                            f"上下文用量已达到 {args.stop:.0%} 硬停止线。刚才的工具操作已完成，"
+                            "将此作为当前原子小步骤的安全边界；不再开始新步骤。"
+                            "立即运行 final-check，然后说明当前停止位置、附上 footer，并等待用户决定是否生成交接文档。"
+                        ),
+                    }
+                }
+        elif event == "Stop":
             if text and delivered(state, args, incoming.get("last_assistant_message")):
                 state["awaiting_choice"] = "是否生成交接文档" in text
             elif text:

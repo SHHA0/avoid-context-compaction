@@ -16,6 +16,7 @@ from typing import Any
 
 DEFAULT_WARN = 0.75
 DEFAULT_HANDOFF = 0.85
+DEFAULT_STOP = 0.90
 DEFAULT_STALE_SECONDS = 300
 DATA_DIR_NAME = ".avoid-context-compaction"
 LEGACY_DATA_DIR_NAME = ".context-guard"
@@ -81,7 +82,8 @@ def is_compaction_event(record: dict[str, Any]) -> bool:
     return top in known or inner in known
 
 
-def read_usage(transcript: Path, warn: float, handoff: float, stale_seconds: int) -> dict[str, Any]:
+def read_usage(transcript: Path, warn: float, handoff: float, stale_seconds: int,
+               stop: float = DEFAULT_STOP) -> dict[str, Any]:
     latest: dict[str, Any] | None = None
     latest_line = 0
     last_compaction_line = 0
@@ -136,7 +138,12 @@ def read_usage(transcript: Path, warn: float, handoff: float, stale_seconds: int
     stamp = parse_time(latest.get("timestamp"))
     age = max(0, int((utcnow() - stamp).total_seconds())) if stamp else None
     conservative = (inputs + outputs) / window
-    level = "handoff" if conservative >= handoff else "warning" if conservative >= warn else "ok"
+    level = (
+        "hard_stop" if conservative >= stop else
+        "handoff" if conservative >= handoff else
+        "warning" if conservative >= warn else
+        "ok"
+    )
     if age is None or age > stale_seconds:
         level = "stale"
     base.update(
@@ -160,7 +167,7 @@ def usage_status(args: argparse.Namespace, transcript_override: str | None = Non
         transcript = find_transcript(codex_home(args.codex_home), sid)
     if transcript is None or not transcript.exists():
         return {"session_id": sid, "level": "unknown", "reason": "matching transcript not found", "transcript": str(transcript) if transcript else None}
-    result = read_usage(transcript, args.warn, args.handoff, args.stale_seconds)
+    result = read_usage(transcript, args.warn, args.handoff, args.stale_seconds, args.stop)
     result["session_id"] = sid
     return result
 
@@ -277,7 +284,8 @@ def save_checkpoint(args: argparse.Namespace, monitor_path: Path, monitor_state:
     atomic_text(resume_path, resume)
     atomic_json(base / "current.json", {"generation": generation.name, "handoff": str(handoff_path), "resume": str(resume_path), "saved_at": meta["saved_at"]})
     if monitor_state.get("enabled"):
-        monitor_state.update(approved=False, suppress_turn=True, pending_peak=0, pending_compaction=False)
+        monitor_state.update(approved=False, suppress_turn=True, pending_peak=0, pending_compaction=False,
+                             hard_stop_pending=False, hard_stop_injected_turn=None)
         atomic_json(monitor_path, monitor_state)
     print(json.dumps({"handoff": str(handoff_path), "resume": str(resume_path), "checkpoint": str(checkpoint_path)}, ensure_ascii=False, indent=2))
     return 0
@@ -308,6 +316,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--transcript")
     parser.add_argument("--warn", type=float, default=DEFAULT_WARN)
     parser.add_argument("--handoff", type=float, default=DEFAULT_HANDOFF)
+    parser.add_argument("--stop", type=float, default=DEFAULT_STOP)
     parser.add_argument("--stale-seconds", type=int, default=DEFAULT_STALE_SECONDS)
     sub = parser.add_subparsers(dest="command", required=True)
     status_parser = sub.add_parser("status")
@@ -327,8 +336,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     configure_stdio()
     args = build_parser().parse_args()
-    if not 0 < args.warn < args.handoff < 1:
-        print("thresholds must satisfy 0 < warn < handoff < 1", file=sys.stderr)
+    if not 0 < args.warn < args.handoff < args.stop < 1:
+        print("thresholds must satisfy 0 < warn < handoff < stop < 1", file=sys.stderr)
         return 2
     try:
         if args.command == "status":

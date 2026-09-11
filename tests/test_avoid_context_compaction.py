@@ -46,6 +46,14 @@ class ContextGuardTests(unittest.TestCase):
             self.assertEqual(result["input_tokens"], 800)
             self.assertAlmostEqual(result["conservative_ratio"], 0.86)
 
+    def test_hard_stop_level(self):
+        with tempfile.TemporaryDirectory() as temp:
+            transcript = Path(temp) / "rollout-session-a.jsonl"
+            self.write_jsonl(transcript, [event(cg.utcnow().isoformat(), 900, 10)])
+            result = cg.read_usage(transcript, 0.75, 0.85, 300, 0.90)
+            self.assertEqual(result["level"], "hard_stop")
+            self.assertAlmostEqual(result["conservative_ratio"], 0.91)
+
     def test_compaction_invalidates_older_snapshot(self):
         with tempfile.TemporaryDirectory() as temp:
             transcript = Path(temp) / "rollout-session-a.jsonl"
@@ -106,6 +114,17 @@ class ContextGuardTests(unittest.TestCase):
             self.assertFalse((installed / ".git").exists())
             self.assertFalse((installed / "obsolete.txt").exists())
             self.assertIn("Stop", merged["hooks"])
+            self.assertIn("PreToolUse", merged["hooks"])
+            managed_handlers = [
+                h
+                for groups in merged["hooks"].values()
+                for group in groups
+                for h in group.get("hooks", [])
+                if "avoid_context_compaction.py" in str(h)
+            ]
+            self.assertTrue(managed_handlers)
+            self.assertTrue(all(h["commandWindows"].startswith('& "') for h in managed_handlers))
+            self.assertTrue(all(not h["command"].startswith("& ") for h in managed_handlers))
             agents = (home / "AGENTS.md").read_text(encoding="utf-8")
             self.assertEqual(agents.count("avoid-context-compaction:basic-monitor:begin"), 1)
             self.assertIn("final-check", agents)

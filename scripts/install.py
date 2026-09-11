@@ -13,7 +13,7 @@ import tempfile
 from pathlib import Path
 
 
-EVENTS = ("SessionStart", "UserPromptSubmit", "PostToolUse", "PreCompact", "Stop")
+EVENTS = ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PreCompact", "Stop")
 INSTALL_IGNORES = (".git", ".avoid-context-compaction", ".context-guard", "__pycache__", "*.pyc")
 BASIC_BEGIN = "<!-- avoid-context-compaction:basic-monitor:begin -->"
 BASIC_END = "<!-- avoid-context-compaction:basic-monitor:end -->"
@@ -60,6 +60,7 @@ For the main agent only, immediately before every final response:
 1. Run `{command}`, replacing `<current-workspace-root>` with the absolute workspace root for the active task.
 2. If the command reports `enabled: true`, append its nonempty `footer` verbatim at the very end of the final response. This includes the normal below-threshold status, so the user can verify that the check ran.
 3. If the footer asks whether to generate a handoff, wait for the user's actual choice. On yes, follow the installed `$avoid-context-compaction` skill to record consent and generate it immediately. On no, record the choice and generate nothing.
+4. At the 90% hard-stop line, finish only the already-started atomic step, stop the current task at a safe boundary, append the footer, and wait for the user's choice. Do not start another substantive step.
 
 If monitoring is not enabled for the current session/workspace, do nothing. Do not claim that lifecycle Hooks are running unless `doctor` reports an observed Stop event.
 {BASIC_END}"""
@@ -130,13 +131,14 @@ def main() -> int:
             groups[:] = preserved
             groups.extend(template["hooks"][event])
         command = f'"{executable}" "{installed_script}" hook'
+        command_windows = f'& "{executable}" "{installed_script}" hook'
         for event in EVENTS:
             for group in existing["hooks"][event]:
                 if not is_managed_group(group):
                     continue
                 for handler in group.get("hooks", []):
                     handler["command"] = command
-                    handler["commandWindows"] = command
+                    handler["commandWindows"] = command_windows
         atomic_json(hooks_path, existing)
     if legacy_target.exists():
         skills_root = (home / "skills").resolve()
