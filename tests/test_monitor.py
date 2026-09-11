@@ -34,6 +34,13 @@ class MonitorTests(unittest.TestCase):
             monitor.command(args)
         return json.loads(output.getvalue())
 
+    def hook_mode(self, choice):
+        args = core.build_parser().parse_args(self.global_args + ["hook-mode", "--choice", choice])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            monitor.hook_mode(args)
+        return json.loads(output.getvalue())
+
     def hook(self, event, **fields):
         args = core.build_parser().parse_args(self.global_args + ["hook"])
         incoming = dict(hook_event_name=event, session_id="session-a", cwd=str(self.project),
@@ -72,6 +79,7 @@ class MonitorTests(unittest.TestCase):
         activated = self.command("activate")
         self.assertIn("63.0%", activated["footer"])
         self.assertEqual(activated["automatic_monitoring"], "unverified")
+        self.assertTrue(activated["hook_setup"]["offer"])
         original = self.state()["activated_at"]
         self.append(.85)
         self.command("final-check")
@@ -79,6 +87,30 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(self.state()["activated_at"], original)
         self.assertEqual(self.state()["pending_peak"], .85)
         self.assertFalse(list(self.project.rglob("HANDOFF.md")))
+
+    def test_basic_hook_choice_persists_across_sessions_without_reprompt(self):
+        self.append(.30)
+        self.assertTrue(self.command("activate")["hook_setup"]["offer"])
+        selected = self.hook_mode("basic")
+        self.assertEqual(selected["mode"], "basic")
+        self.assertFalse(selected["offer"])
+        self.global_args[1] = "session-b"
+        activated = self.command("activate")
+        self.assertEqual(activated["hook_setup"]["mode"], "basic")
+        self.assertFalse(activated["hook_setup"]["offer"])
+
+    def test_enhanced_hook_choice_returns_steps_and_can_be_reset(self):
+        selected = self.hook_mode("enhanced")
+        self.assertEqual(selected["mode"], "enhanced")
+        self.assertTrue(selected["action_required"])
+        self.assertTrue(any("--with-hooks" in step for step in selected["steps"]))
+        self.append(.30)
+        activated = self.command("activate")
+        self.assertFalse(activated["hook_setup"]["offer"])
+        self.assertTrue(activated["hook_setup"]["action_required"])
+        self.hook_mode("ask")
+        self.global_args[1] = "session-b"
+        self.assertTrue(self.command("activate")["hook_setup"]["offer"])
 
     def test_thresholds_and_stop_correction_loop_guard(self):
         self.append(.74)
@@ -251,6 +283,8 @@ class MonitorTests(unittest.TestCase):
         self.append(.30)
         result = self.command("activate")
         self.assertEqual(result["missing_events"], [])
+        self.assertTrue(result["hook_setup"]["configured"])
+        self.assertFalse(result["hook_setup"]["offer"])
         self.assertEqual(result["automatic_monitoring"], "unverified")
         self.assertEqual(result["hard_stop_enforcement"], "unverified")
         self.hook("Stop", last_assistant_message="done")

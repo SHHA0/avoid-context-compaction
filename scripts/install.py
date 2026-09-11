@@ -17,6 +17,7 @@ EVENTS = ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PreC
 INSTALL_IGNORES = (".git", ".avoid-context-compaction", ".context-guard", "__pycache__", "*.pyc")
 BASIC_BEGIN = "<!-- avoid-context-compaction:basic-monitor:begin -->"
 BASIC_END = "<!-- avoid-context-compaction:basic-monitor:end -->"
+PREFERENCES_FILE = "avoid-context-compaction.json"
 
 
 def atomic_json(path: Path, value: object) -> None:
@@ -140,6 +141,12 @@ def main() -> int:
                     handler["command"] = command
                     handler["commandWindows"] = command_windows
         atomic_json(hooks_path, existing)
+        preferences_path = home / PREFERENCES_FILE
+        preferences = json.loads(preferences_path.read_text(encoding="utf-8-sig")) if preferences_path.exists() else {}
+        if not isinstance(preferences, dict):
+            raise ValueError(f"unsupported preferences file structure: {preferences_path}")
+        preferences.update(hook_mode="enhanced")
+        atomic_json(preferences_path, preferences)
     if legacy_target.exists():
         skills_root = (home / "skills").resolve()
         if legacy_target.resolve().parent != skills_root:

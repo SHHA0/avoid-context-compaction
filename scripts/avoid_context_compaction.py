@@ -247,8 +247,50 @@ def render_handoff(data: dict[str, Any], meta: dict[str, Any]) -> str:
 def checkpoint(args: argparse.Namespace) -> int:
     import monitor
     monitor_path = monitor.state_path(args.project, session_id(args.session_id) or "manual")
+    handoff_lock = Path(args.project).resolve() / DATA_DIR_NAME / "handoff.json"
     with monitor.locked(monitor_path):
-        return save_checkpoint(args, monitor_path, monitor.load(monitor_path))
+        with monitor.locked(handoff_lock):
+            return save_checkpoint(args, monitor_path, monitor.load(monitor_path))
+
+
+def _pointer_paths(project: Path, pointer: Path) -> tuple[Path, Path, Path] | None:
+    try:
+        value = json.loads(pointer.read_text(encoding="utf-8-sig"))
+        handoff = Path(value["handoff"]).resolve()
+        resume = Path(value["resume"]).resolve()
+        checkpoint_path = Path(value.get("checkpoint") or handoff.with_name("checkpoint.json")).resolve()
+        allowed = ((project / DATA_DIR_NAME).resolve(), (project / LEGACY_DATA_DIR_NAME).resolve())
+        if not all(any(path.is_relative_to(root) for root in allowed) for path in (handoff, resume, checkpoint_path)):
+            raise ValueError(f"handoff pointer escapes project data directory: {pointer}")
+        return handoff, resume, checkpoint_path
+    except (OSError, KeyError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def current_handoff_targets(project: Path) -> tuple[Path, Path, Path]:
+    root = project / DATA_DIR_NAME
+    primary = root / "current.json"
+    if primary.exists():
+        paths = _pointer_paths(project, primary)
+        if paths:
+            return paths
+    candidates = list(root.glob("*/current.json"))
+    legacy_root = project / LEGACY_DATA_DIR_NAME
+    if legacy_root.exists():
+        candidates.extend(legacy_root.glob("*/current.json"))
+    valid = []
+    for pointer in candidates:
+        paths = _pointer_paths(project, pointer)
+        if paths:
+            try:
+                value = json.loads(pointer.read_text(encoding="utf-8-sig"))
+                stamp = parse_time(value.get("saved_at"))
+            except (OSError, TypeError, json.JSONDecodeError):
+                stamp = None
+            valid.append((stamp or dt.datetime.fromtimestamp(pointer.stat().st_mtime, dt.timezone.utc), paths))
+    if valid:
+        return max(valid, key=lambda item: item[0])[1]
+    return root / "HANDOFF.md", root / "RESUME.txt", root / "checkpoint.json"
 
 
 def save_checkpoint(args: argparse.Namespace, monitor_path: Path, monitor_state: dict[str, Any]) -> int:
@@ -258,20 +300,11 @@ def save_checkpoint(args: argparse.Namespace, monitor_path: Path, monitor_state:
         raise ValueError("user choice required: after the user agrees, run decision --choice yes before checkpoint")
     project = Path(args.project).resolve()
     sid = safe_id(session_id(args.session_id) or "manual")
-    stamp = utcnow().strftime("%Y%m%dT%H%M%SZ")
-    base = project / DATA_DIR_NAME / sid
-    generation = base / stamp
-    suffix = 1
-    while generation.exists():
-        generation = base / f"{stamp}-{suffix}"
-        suffix += 1
-    generation.mkdir(parents=True)
+    base = project / DATA_DIR_NAME
     usage = usage_status(args)
     meta = {"saved_at": utcnow().isoformat(), "session_id": sid, "project": str(project), "usage": usage}
     handoff = render_handoff(data, meta)
-    handoff_path = generation / "HANDOFF.md"
-    resume_path = generation / "RESUME.txt"
-    checkpoint_path = generation / "checkpoint.json"
+    handoff_path, resume_path, checkpoint_path = current_handoff_targets(project)
     resume = (
         f"继续项目“{project}”中的任务“{data['task']}”。\n\n"
         f"先完整读取交接文件：{handoff_path}\n"
@@ -282,7 +315,10 @@ def save_checkpoint(args: argparse.Namespace, monitor_path: Path, monitor_state:
     atomic_json(checkpoint_path, {"meta": meta, "checkpoint": data})
     atomic_text(handoff_path, handoff)
     atomic_text(resume_path, resume)
-    atomic_json(base / "current.json", {"generation": generation.name, "handoff": str(handoff_path), "resume": str(resume_path), "saved_at": meta["saved_at"]})
+    atomic_json(base / "current.json", {
+        "handoff": str(handoff_path), "resume": str(resume_path), "checkpoint": str(checkpoint_path),
+        "saved_at": meta["saved_at"]
+    })
     if monitor_state.get("enabled"):
         monitor_state.update(approved=False, suppress_turn=True, pending_peak=0, pending_compaction=False,
                              hard_stop_pending=False, hard_stop_injected_turn=None)
@@ -292,16 +328,12 @@ def save_checkpoint(args: argparse.Namespace, monitor_path: Path, monitor_state:
 
 
 def load_current_handoff(project: Path, sid: str) -> tuple[Path | None, str | None]:
-    for directory in (DATA_DIR_NAME, LEGACY_DATA_DIR_NAME):
-        pointer = project / directory / safe_id(sid) / "current.json"
-        if not pointer.exists():
-            continue
-        try:
-            path = Path(json.loads(pointer.read_text(encoding="utf-8"))["handoff"])
-            return (path, path.read_text(encoding="utf-8")) if path.exists() else (path, None)
-        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
-            return pointer, None
-    return None, None
+    del sid  # Handoffs are project-scoped; monitor state remains session-scoped.
+    try:
+        path, _, _ = current_handoff_targets(project)
+        return (path, path.read_text(encoding="utf-8")) if path.exists() else (None, None)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return project / DATA_DIR_NAME / "current.json", None
 
 
 def hook(args: argparse.Namespace) -> int:
@@ -325,6 +357,8 @@ def build_parser() -> argparse.ArgumentParser:
     cp.add_argument("--input", required=True)
     cp.add_argument("--project", required=True)
     sub.add_parser("hook")
+    hook_mode_parser = sub.add_parser("hook-mode")
+    hook_mode_parser.add_argument("--choice", choices=("basic", "enhanced", "ask"), required=True)
     for name in ("activate", "final-check", "decision", "doctor"):
         command_parser = sub.add_parser(name)
         command_parser.add_argument("--project", required=True)
@@ -349,6 +383,8 @@ def main() -> int:
         if args.command == "hook":
             return hook(args)
         import monitor
+        if args.command == "hook-mode":
+            return monitor.hook_mode(args)
         return monitor.command(args)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         if args.command == "hook":

@@ -19,6 +19,15 @@ Use the current CODEX_THREAD_ID or CODEX_SESSION_ID; never choose another conver
 
 Read `basic_instructions_configured` in the result. If false, explain that persistent basic monitoring requires `python scripts/install.py` followed by a Codex restart; still perform the current turn's explicit check. Read `automatic_monitoring` only when optional Hooks are relevant. Say Hooks are verified only after an observed Stop event. Do not generate a handoff on activation alone.
 
+Read the returned `hook_setup` object on activation:
+
+- If `offer` is true, ask **是否配置 Hook 增强模式？请选择：需要，显示配置步骤 / 不需要，使用默认模式。** Explain briefly that basic mode already works, while trusted Hooks add lifecycle enforcement. Label this as the Hook choice so it cannot be confused with a handoff choice.
+- If the user chooses **不需要 / 默认模式**, run `python <skill>/scripts/avoid_context_compaction.py hook-mode --choice basic`. This global preference applies across projects and future conversations; do not prompt about Hook mode again.
+- If the user chooses **需要 / Hook 增强模式**, run the same command with `--choice enhanced`, then present every returned setup step. Never install or trust Hooks merely from an ambiguous reply.
+- If `action_required` is true, present the returned steps. If `configured` is true, do not offer setup again; use `doctor` before claiming real Hook delivery.
+
+Use `hook-mode --choice ask` only when the user explicitly asks to reset the saved choice. An unrelated request is not a Hook-mode choice. Hook-mode preference is distinct from the handoff decision command.
+
 ## While working and before every final reply
 
 Continue the user's work. At meaningful work boundaries, and **immediately before every final reply**, run:
@@ -47,7 +56,7 @@ After consent, gather factual task state using [checkpoints.md](references/check
 python <skill>/scripts/avoid_context_compaction.py checkpoint --input <file> --project <absolute-session-project>
 ```
 
-Read the resulting HANDOFF.md and RESUME.txt. Provide clickable absolute file links and the exact resume instructions. Preserve the original goal, user corrections and scope, decisions and reasons, rejected approaches, verified results, unverified changes, remaining work, and relevant running processes or approvals. The script formats supplied facts; it cannot infer accomplishments. Do not copy secrets or whole transcripts.
+Read the resulting HANDOFF.md and RESUME.txt. Provide clickable absolute file links and the exact resume instructions. The project keeps one current handoff set: later saves, including saves from a new conversation, atomically update the same files instead of creating per-session generations. On the first save after upgrading from an older release, the script reuses the newest valid legacy handoff target when available. Preserve the original goal, user corrections and scope, decisions and reasons, rejected approaches, verified results, unverified changes, remaining work, and relevant running processes or approvals. The script formats supplied facts; it cannot infer accomplishments. Do not copy secrets or whole transcripts.
 
 On recovery, read the specifically supplied handoff and applicable AGENTS.md, then reconcile actual files and verification evidence before continuing. Do not select an unrelated task because its handoff is newer. After an interrupted operation, verify whether it completed before retrying.
 

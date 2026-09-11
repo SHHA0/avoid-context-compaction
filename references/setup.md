@@ -6,9 +6,18 @@ Restart Codex so the global instruction is loaded. Basic mode requires no Hook t
 
 Installation does not activate all conversations. Invoke the skill once in the intended conversation so it runs `activate --project <absolute-session-project>`. State is scoped to that session ID and the session working directory. A new conversation must opt in separately. When changing the session's project directory, activate there too; do not pick another project's latest state.
 
+On the first activation, `activate` checks both installed Hook definitions and the global preference at `<CODEX_HOME>/avoid-context-compaction.json`. If Hooks are absent and no choice exists, the agent asks whether to use Hook enhanced mode. `hook-mode --choice basic` permanently selects the default mode and suppresses future Hook prompts; `hook-mode --choice enhanced` records the request and returns the steps below; `hook-mode --choice ask` resets the preference. This preference is global, while activation and usage state remain session/project scoped.
+
 ## Optional lifecycle Hooks
 
 Install them with `python <skill>/scripts/install.py --with-hooks`, restart Codex, then review/trust the updated definitions in the client (CLI: `/hooks`). Do not write trust records or bypass Hook trust. See [official Hooks documentation](https://learn.chatgpt.com/zh-Hans/docs/hooks).
+
+The enhanced-mode choice does not silently install or trust anything. Its returned procedure is:
+
+1. Run the displayed absolute `install.py --codex-home ... --with-hooks` command.
+2. Restart Codex.
+3. Open `/hooks`, review the avoid-context-compaction handlers, and explicitly trust them.
+4. Invoke the skill in the intended conversation and run `doctor`; verify real `Stop`, `PreToolUse`, and `PostToolUse` timestamps.
 
 Hooks add these guards:
 

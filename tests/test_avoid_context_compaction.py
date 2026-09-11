@@ -72,7 +72,7 @@ class ContextGuardTests(unittest.TestCase):
             os.utime(other, None)
             self.assertEqual(cg.find_transcript(root, "session-a"), wanted)
 
-    def test_checkpoint_generations_and_installer_merge(self):
+    def test_checkpoint_updates_one_project_handoff_and_installer_merge(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             project = root / "project"
@@ -89,11 +89,16 @@ class ContextGuardTests(unittest.TestCase):
             env = dict(os.environ, CODEX_THREAD_ID="test-session")
             command = [sys.executable, str(SCRIPT), "checkpoint", "--input", str(input_file), "--project", str(project)]
             first = subprocess.run(command, env=env, check=True, capture_output=True, text=True)
+            updated = json.loads(input_file.read_text(encoding="utf-8"))
+            updated["task"] = "Update guard"
+            input_file.write_text(json.dumps(updated), encoding="utf-8")
             second = subprocess.run(command, env=env, check=True, capture_output=True, text=True)
             first_result = json.loads(first.stdout)
             second_result = json.loads(second.stdout)
-            self.assertNotEqual(first_result["handoff"], second_result["handoff"])
+            self.assertEqual(first_result["handoff"], second_result["handoff"])
             self.assertTrue(Path(second_result["resume"]).exists())
+            self.assertIn("Update guard", Path(second_result["handoff"]).read_text(encoding="utf-8"))
+            self.assertEqual(len(list((project / cg.DATA_DIR_NAME).rglob("HANDOFF.md"))), 1)
 
             home = root / "codex-home"
             hooks = {"description": "existing", "hooks": {"SessionStart": [{"hooks": [
@@ -115,6 +120,8 @@ class ContextGuardTests(unittest.TestCase):
             self.assertFalse((installed / "obsolete.txt").exists())
             self.assertIn("Stop", merged["hooks"])
             self.assertIn("PreToolUse", merged["hooks"])
+            preferences = json.loads((home / "avoid-context-compaction.json").read_text(encoding="utf-8"))
+            self.assertEqual(preferences["hook_mode"], "enhanced")
             managed_handlers = [
                 h
                 for groups in merged["hooks"].values()
@@ -129,6 +136,33 @@ class ContextGuardTests(unittest.TestCase):
             self.assertEqual(agents.count("avoid-context-compaction:basic-monitor:begin"), 1)
             self.assertIn("final-check", agents)
 
+    def test_checkpoint_reuses_newest_legacy_handoff_target(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            project = root / "project"
+            old = project / cg.DATA_DIR_NAME / "old-session" / "20260101T000000Z"
+            old.mkdir(parents=True)
+            handoff = old / "HANDOFF.md"
+            resume = old / "RESUME.txt"
+            checkpoint = old / "checkpoint.json"
+            handoff.write_text("old", encoding="utf-8")
+            resume.write_text("old", encoding="utf-8")
+            checkpoint.write_text("{}", encoding="utf-8")
+            cg.atomic_json(old.parent / "current.json", {
+                "handoff": str(handoff), "resume": str(resume), "saved_at": "2026-01-01T00:00:00+00:00"
+            })
+            input_file = root / "input.json"
+            data = {key: [] for key in cg.LIST_FIELDS}
+            data.update(task="Updated task", goal="Update the existing handoff", status="ready")
+            input_file.write_text(json.dumps(data), encoding="utf-8")
+            env = dict(os.environ, CODEX_THREAD_ID="new-session")
+            command = [sys.executable, str(SCRIPT), "checkpoint", "--input", str(input_file), "--project", str(project)]
+            result = json.loads(subprocess.run(command, env=env, check=True, capture_output=True, text=True).stdout)
+            self.assertEqual(Path(result["handoff"]), handoff)
+            self.assertIn("Updated task", handoff.read_text(encoding="utf-8"))
+            pointer = json.loads((project / cg.DATA_DIR_NAME / "current.json").read_text(encoding="utf-8"))
+            self.assertEqual(Path(pointer["checkpoint"]), checkpoint)
+
     def test_basic_install_preserves_agents_and_does_not_create_hooks(self):
         with tempfile.TemporaryDirectory() as temp:
             home = Path(temp) / "codex-home"
@@ -142,6 +176,7 @@ class ContextGuardTests(unittest.TestCase):
             self.assertIn("# Existing rule", agents)
             self.assertEqual(agents.count("avoid-context-compaction:basic-monitor:begin"), 1)
             self.assertFalse((home / "hooks.json").exists())
+            self.assertFalse((home / "avoid-context-compaction.json").exists())
             self.assertFalse(result["hook_trust_required"])
 
 

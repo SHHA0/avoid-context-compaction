@@ -13,10 +13,15 @@ import avoid_context_compaction as core
 
 EVENTS = ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PreCompact", "Stop")
 BASIC_BEGIN = "<!-- avoid-context-compaction:basic-monitor:begin -->"
+PREFERENCES_FILE = "avoid-context-compaction.json"
 
 
 def state_path(project, sid):
     return Path(project).resolve() / core.DATA_DIR_NAME / core.safe_id(sid) / "monitor.json"
+
+
+def preferences_path(args):
+    return core.codex_home(args.codex_home) / PREFERENCES_FILE
 
 
 @contextlib.contextmanager
@@ -60,6 +65,103 @@ def load(path):
     if not isinstance(state, dict):
         raise ValueError("invalid monitor state")
     return state
+
+
+def configured_events(args):
+    path = core.codex_home(args.codex_home) / "hooks.json"
+    configured = []
+    if path.exists():
+        config = json.loads(path.read_text(encoding="utf-8-sig"))
+        if isinstance(config, dict) and isinstance(config.get("hooks"), dict):
+            for event, groups in config["hooks"].items():
+                if isinstance(groups, list) and any("avoid_context_compaction.py" in str(g) for g in groups):
+                    configured.append(event)
+    return configured
+
+
+def load_preferences(args):
+    path = preferences_path(args)
+    if not path.exists():
+        return {}
+    preferences = json.loads(path.read_text(encoding="utf-8-sig"))
+    if not isinstance(preferences, dict):
+        raise ValueError(f"invalid preferences file: {path}")
+    return preferences
+
+
+def hook_install_steps(args):
+    executable = Path(core.sys.executable).resolve()
+    installer = Path(core.__file__).resolve().with_name("install.py")
+    home = core.codex_home(args.codex_home)
+    return [
+        f'Run: "{executable}" "{installer}" --codex-home "{home}" --with-hooks',
+        "Restart Codex so the updated lifecycle Hook definitions are loaded.",
+        "Open /hooks, review the avoid-context-compaction handlers, and explicitly trust them.",
+        "Invoke $avoid-context-compaction in the intended conversation, then run doctor and verify real Stop, PreToolUse, and PostToolUse events.",
+    ]
+
+
+def hook_setup(args, first_activation=False):
+    configured = configured_events(args)
+    complete = all(event in configured for event in EVENTS)
+    preference = load_preferences(args).get("hook_mode")
+    if complete:
+        return {
+            "mode": "enhanced",
+            "configured": True,
+            "offer": False,
+            "action_required": False,
+            "message": "Hook enhanced mode is configured; use doctor to verify actual event delivery and trust.",
+        }
+    if preference == "basic":
+        return {
+            "mode": "basic",
+            "configured": False,
+            "offer": False,
+            "action_required": False,
+            "message": "Basic mode was selected globally; do not prompt about Hook enhanced mode again.",
+        }
+    if preference == "enhanced":
+        return {
+            "mode": "enhanced",
+            "configured": False,
+            "offer": False,
+            "action_required": True,
+            "message": "Hook enhanced mode was requested but is not fully configured.",
+            "steps": hook_install_steps(args),
+        }
+    return {
+        "mode": "unselected",
+        "configured": False,
+        "offer": bool(first_activation),
+        "action_required": False,
+        "message": (
+            "Hook enhanced mode is not configured. Ask once in this conversation: "
+            "是否配置 Hook 增强模式？请选择：需要，显示配置步骤 / 不需要，使用默认模式。"
+        ),
+    }
+
+
+def hook_mode(args):
+    path = preferences_path(args)
+    with locked(path):
+        preferences = load_preferences(args)
+        if args.choice == "ask":
+            preferences.pop("hook_mode", None)
+            preferences.pop("hook_mode_chosen_at", None)
+        else:
+            preferences.update(hook_mode=args.choice, hook_mode_chosen_at=core.utcnow().isoformat())
+        core.atomic_json(path, preferences)
+    result = {"choice": args.choice, "preferences": str(path), **hook_setup(args)}
+    if args.choice == "basic":
+        result["message"] = "Basic mode selected globally. Future conversations must not prompt about Hook mode."
+    elif args.choice == "enhanced":
+        result["message"] = "Hook enhanced mode selected globally. Complete the returned steps; trust is never written automatically."
+        result["steps"] = hook_install_steps(args)
+    else:
+        result["message"] = "Hook mode preference cleared. The next newly activated conversation will offer the choice again if Hooks are absent."
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
 
 
 def remember(state, usage):
@@ -195,18 +297,13 @@ def delivered(state, args, message):
 
 
 def health(args, state):
-    path = core.codex_home(args.codex_home) / "hooks.json"
-    configured = []
-    if path.exists():
-        config = json.loads(path.read_text(encoding="utf-8-sig"))
-        for event, groups in config.get("hooks", {}).items():
-            if any("avoid_context_compaction.py" in str(g) for g in groups):
-                configured.append(event)
+    configured = configured_events(args)
     agents_path = core.codex_home(args.codex_home) / "AGENTS.md"
     basic_configured = agents_path.exists() and BASIC_BEGIN in agents_path.read_text(encoding="utf-8-sig")
     observed = state.get("observed_events", {})
     return {
         "basic_instructions_configured": basic_configured,
+        "hook_mode_preference": load_preferences(args).get("hook_mode", "unselected"),
         "last_final_check": state.get("last_final_check"),
         "final_check_count": state.get("final_check_count", 0),
         "configured_events": configured,
@@ -234,6 +331,7 @@ def command(args):
         return 0
     with locked(path):
         state = load(path)
+        first_activation = args.command == "activate" and not state.get("enabled")
         if args.command == "activate" and not state.get("enabled"):
             state = {"enabled": True, "session_id": sid, "project": str(Path(args.project).resolve()),
                      "activated_at": core.utcnow().isoformat(), "observed_events": {}}
@@ -254,6 +352,8 @@ def command(args):
             if "是否生成交接文档" in text:
                 state["awaiting_choice"] = True
             output = {"enabled": True, "usage": state["usage"], "footer": text, **health(args, state)}
+            if args.command == "activate":
+                output["hook_setup"] = hook_setup(args, first_activation=first_activation)
         core.atomic_json(path, state)
     print(json.dumps(output, ensure_ascii=False, indent=2))
     return 0
@@ -295,7 +395,7 @@ def hook(args):
             allowed_control = (
                 isinstance(command, str)
                 and "avoid_context_compaction.py" in command
-                and any(re.search(rf"\b{name}\b", command) for name in ("final-check", "decision", "checkpoint"))
+                and any(re.search(rf"\b{name}\b", command) for name in ("final-check", "decision", "checkpoint", "hook-mode"))
             )
             if not allowed_control:
                 output = {
