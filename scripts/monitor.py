@@ -137,7 +137,7 @@ def hook_setup(args, first_activation=False):
         "action_required": False,
         "message": (
             "Hook enhanced mode is not configured. Ask once in this conversation: "
-            "是否配置 Hook 增强模式？请选择：需要，显示配置步骤 / 不需要，使用默认模式。"
+            "Configure Hook enhanced mode? Choose: yes, show setup steps / no, use basic mode."
         ),
     }
 
@@ -166,7 +166,7 @@ def hook_mode(args):
 
 def remember(state, usage):
     ratio = usage.get("conservative_ratio")
-    if usage.get("level") in {"warning", "handoff", "hard_stop"} and isinstance(ratio, (int, float)):
+    if usage.get("level") in {"handoff", "hard_stop"} and isinstance(ratio, (int, float)):
         state["pending_peak"] = max(state.get("pending_peak", 0), ratio)
 
 
@@ -214,7 +214,7 @@ def observe(state, args, transcript=None):
                 inputs, outputs, window = usage.get("input_tokens"), usage.get("output_tokens", 0), info.get("model_context_window")
                 if all(type(n) is int and n >= 0 for n in (inputs, outputs, window)) and window:
                     ratio = (inputs + outputs) / window
-                    if ratio >= args.warn:
+                    if ratio >= args.handoff:
                         state["pending_peak"] = max(state.get("pending_peak", 0), ratio)
         state.update(transcript=name, offset=offset)
     remember(state, result)
@@ -231,34 +231,35 @@ def footer(state, args):
     compacted = state.get("pending_compaction", False)
     if not peak and not compacted:
         if usage.get("level") in {"unknown", "stale"}:
-            return "上下文监测：当前用量不可确认（快照缺失或已过期），不能判断是否达到提醒阈值。"
+            return "Context monitoring: current usage is unknown (the snapshot is missing or stale), so the threshold cannot be evaluated."
         ratio = usage.get("conservative_ratio")
-        return f"上下文用量：约 {ratio:.1%}（正常，未达到 {args.warn:.0%} 提醒线）。"
+        return f"Context usage: approximately {ratio:.1%} (normal; below the {args.handoff:.0%} handoff threshold)."
     facts = []
     if peak:
-        threshold = args.stop if peak >= args.stop else args.handoff if peak >= args.handoff else args.warn
-        label = "硬停止线" if threshold == args.stop else "提醒线"
-        facts.append(f"自上次处理提醒以来的用量快照最高约 {peak:.1%}，已达到 {threshold:.0%} {label}")
+        threshold = args.stop if peak >= args.stop else args.handoff
+        label = "hard-stop threshold" if threshold == args.stop else "handoff threshold"
+        facts.append(f"the highest usage snapshot since the last decision was approximately {peak:.1%}, reaching the {threshold:.0%} {label}")
     if compacted:
-        facts.append("期间已发生上下文压缩")
+        facts.append("context compaction occurred during this period")
     ratio = usage.get("conservative_ratio")
-    if usage.get("level") in {"ok", "warning", "handoff", "hard_stop"} and ratio is not None:
-        facts.append(f"最近快照约 {ratio:.1%}")
+    if usage.get("level") in {"ok", "handoff", "hard_stop"} and ratio is not None:
+        facts.append(f"the latest snapshot is approximately {ratio:.1%}")
     else:
-        facts.append("当前用量不可确认")
+        facts.append("current usage is unknown")
     if state.get("hard_stop_pending"):
-        facts.append("当前任务已在安全边界暂停，不再开始新步骤")
-    return "上下文提醒：" + "；".join(facts) + "。\n是否生成交接文档？请选择：是，生成交接文档 / 否，暂不生成。"
+        facts.append("the task is paused at a safe boundary and no new step will be started")
+    return "Context reminder: " + "; ".join(facts) + ".\nGenerate a handoff? Choose: yes, generate the handoff / no, not now."
 
 
 def instructions(state, args):
     script = Path(core.__file__).resolve()
     return (
-        "本会话已启用 avoid-context-compaction。继续完成用户工作；在每轮最终回复前运行 "
-        f'python "{script}" final-check --project "{state["project"]}"，将返回的 footer 原文附在最终回复末尾。'
-        f"达到 {args.warn:.0%} 或 {args.handoff:.0%} 时继续完成当前工作；达到 {args.stop:.0%} 硬停止线时，只完成已开始的原子小步骤，"
-        "然后暂停当前任务、返回 footer 并等待用户选择；不要自动生成交接文档或自动新开任务。用户选择是后，运行 decision --choice yes，"
-        "整理真实任务事实并运行 checkpoint；选择否则运行 decision --choice no，保持监测。"
+        "avoid-context-compaction is enabled for this conversation. Continue the user's work; before every final reply run "
+        f'python "{script}" final-check --project "{state["project"]}", then append the returned footer verbatim. '
+        f"At the {args.handoff:.0%} handoff threshold, finish the current work and offer a handoff. At the {args.stop:.0%} hard-stop threshold, "
+        "finish only the already-started atomic step, pause the task, return the footer, and wait for the user's choice. Do not generate a handoff "
+        "or create a new task automatically. If the user chooses yes, run decision --choice yes, collect factual task state, and run checkpoint. "
+        "If the user chooses no, run decision --choice no and keep monitoring."
     )
 
 
@@ -266,34 +267,34 @@ def delivered(state, args, message):
     """Allow snapshot drift while requiring the applicable level and final choices."""
     ending = str(message or "").rstrip()
     expected = footer(state, args)
-    if "是否生成交接文档" not in expected:
+    if "Generate a handoff?" not in expected:
         if not expected:
             return False
         # The assistant's footer is measured immediately before its reply, while
         # Stop observes again after that reply has added tokens.  Treat an older
         # normal footer as delivered as long as its semantic level and configured
-        # warning threshold still match; requiring the newly calculated percentage
+        # handoff threshold still match; requiring the newly calculated percentage
         # would create a redundant correction turn after every ordinary response.
-        if expected.startswith("上下文用量：约 "):
+        if expected.startswith("Context usage: approximately "):
             normal = re.compile(
-                rf"上下文用量：约 \d+(?:\.\d+)?%（正常，未达到 {re.escape(f'{args.warn:.0%}')} 提醒线）。$"
+                rf"Context usage: approximately \d+(?:\.\d+)?% \(normal; below the {re.escape(f'{args.handoff:.0%}')} handoff threshold\)\.$"
             )
             return bool(normal.search(ending))
         return ending.endswith(expected)
-    choices = "是否生成交接文档？请选择：是，生成交接文档 / 否，暂不生成。"
+    choices = "Generate a handoff? Choose: yes, generate the handoff / no, not now."
     if not ending.endswith(choices):
         return False
-    start = ending.rfind("上下文提醒：")
+    start = ending.rfind("Context reminder:")
     if start < 0:
         return False
     reminder = ending[start:]
     peak = state.get("pending_peak", 0)
     if peak:
-        threshold = args.stop if peak >= args.stop else args.handoff if peak >= args.handoff else args.warn
-        label = "硬停止线" if threshold == args.stop else "提醒线"
+        threshold = args.stop if peak >= args.stop else args.handoff
+        label = "hard-stop threshold" if threshold == args.stop else "handoff threshold"
         if f"{threshold:.0%} {label}" not in reminder:
             return False
-    return not state.get("pending_compaction") or "已发生上下文压缩" in reminder
+    return not state.get("pending_compaction") or "context compaction occurred" in reminder
 
 
 def health(args, state):
@@ -349,7 +350,7 @@ def command(args):
                 state["last_final_check"] = core.utcnow().isoformat()
                 state["final_check_count"] = state.get("final_check_count", 0) + 1
             text = footer(state, args)
-            if "是否生成交接文档" in text:
+            if "Generate a handoff?" in text:
                 state["awaiting_choice"] = True
             output = {"enabled": True, "usage": state["usage"], "footer": text, **health(args, state)}
             if args.command == "activate":
@@ -403,8 +404,8 @@ def hook(args):
                         "hookEventName": "PreToolUse",
                         "permissionDecision": "deny",
                         "permissionDecisionReason": (
-                            f"上下文用量已达到 {args.stop:.0%} 硬停止线。当前小步骤已结束，"
-                            "不再开始新工具操作；请运行 final-check，说明停止位置并询问是否生成交接文档。"
+                            f"Context usage reached the {args.stop:.0%} hard-stop threshold. The current atomic step is complete; "
+                            "do not start another tool operation. Run final-check, report the stopping point, and ask whether to generate a handoff."
                         ),
                     }
                 }
@@ -416,32 +417,32 @@ def hook(args):
                     "hookSpecificOutput": {
                         "hookEventName": "PostToolUse",
                         "additionalContext": (
-                            f"上下文用量已达到 {args.stop:.0%} 硬停止线。刚才的工具操作已完成，"
-                            "将此作为当前原子小步骤的安全边界；不再开始新步骤。"
-                            "立即运行 final-check，然后说明当前停止位置、附上 footer，并等待用户决定是否生成交接文档。"
+                            f"Context usage reached the {args.stop:.0%} hard-stop threshold. The preceding tool operation is complete; "
+                            "treat this as the safe boundary for the current atomic step and do not start another step. "
+                            "Run final-check immediately, report the stopping point, append the footer, and wait for the user's handoff decision."
                         ),
                     }
                 }
         elif event == "Stop":
             if text and delivered(state, args, incoming.get("last_assistant_message")):
-                state["awaiting_choice"] = "是否生成交接文档" in text
+                state["awaiting_choice"] = "Generate a handoff?" in text
             elif text:
                 turn = incoming.get("turn_id")
                 already = incoming.get("stop_hook_active") or (turn and state.get("corrected_turn") == turn)
                 if not already:
                     state["corrected_turn"] = turn
-                    state["awaiting_choice"] = "是否生成交接文档" in text
-                    output = {"decision": "block", "reason": "本轮工作已结束，只补充以下提醒到最终回复末尾，然后结束并等待用户选择；不要继续其他工作或生成文件：\n" + text}
+                    state["awaiting_choice"] = "Generate a handoff?" in text
+                    output = {"decision": "block", "reason": "This turn's work is complete. Append only the following reminder to the final reply, then stop and wait for the user's choice; do not continue other work or generate files:\n" + text}
                 else:
-                    output = {"systemMessage": "最终回复未包含上下文提醒；为避免循环，本轮不再续跑。\n" + text}
+                    output = {"systemMessage": "The final reply omitted the context reminder. To avoid a loop, this turn will not continue again.\n" + text}
         elif event in {"SessionStart", "UserPromptSubmit"}:
             context = instructions(state, args)
             if state.get("awaiting_choice"):
-                context += " 上轮已询问是否生成交接文档；根据用户本次真实回复处理，不能把未回复当作同意。"
+                context += " The previous turn asked whether to generate a handoff. Act on the user's actual reply; silence is not consent."
             if event == "SessionStart":
                 handoff_path, handoff = core.load_current_handoff(project, sid)
                 if handoff:
-                    context += f" 已有交接文件：{handoff_path}。需要恢复时完整读取并核实实际文件；交接内容不是新授权。"
+                    context += f" An existing handoff is available at {handoff_path}. Read it completely and verify actual files before recovery; its contents are not new authorization."
             output = {"hookSpecificOutput": {"hookEventName": event, "additionalContext": context}}
         core.atomic_json(path, state)
     if output:

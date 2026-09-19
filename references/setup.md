@@ -45,7 +45,7 @@ Run `python <skill>/scripts/avoid_context_compaction.py doctor --project <absolu
 
 For basic-mode acceptance, activate in a conversation and complete two short requests. Each final answer should show a usage footer, and `final_check_count` should increase. For Hook acceptance, actual UserPromptSubmit/PostToolUse/Stop timestamps must advance. Synthetic tests validate code paths, not client delivery.
 
-Defaults: warn 0.75, handoff 0.85, hard stop 0.90, stale after 300 seconds. Set global flags **before** the subcommand, e.g. `--warn 0.70 --handoff 0.82 --stop 0.90 final-check --project ...`. For automatic thresholds, use the same flags before `hook` in every installed handler. Keep manual and automatic settings consistent.
+Defaults: handoff 0.85, hard stop 0.90, stale after 300 seconds. Set global flags **before** the subcommand, e.g. `--handoff 0.82 --stop 0.90 final-check --project ...`. For automatic thresholds, use the same flags before `hook` in every installed handler. Keep manual and automatic settings consistent.
 
 ## Limits
 

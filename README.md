@@ -1,13 +1,13 @@
 # Avoid Context Compaction
 
-Enable context monitoring once in a Codex conversation, see a usage status at the **end of every completed task**, choose whether to generate a handoff at **75% or 85%**, and safely pause at **90%** before starting another substantive step.
+Enable context monitoring once in a Codex conversation, see a usage status at the **end of every completed task**, choose whether to generate a handoff at **85%**, and safely pause at **90%** before starting another substantive step.
 
 ## Expected experience
 
 1. Run the installer once, then restart Codex. The default basic installation adds a small managed block to the user's global `AGENTS.md`; it does not install Hooks or require Hook trust.
 2. Send `$avoid-context-compaction` in a conversation. The skill persists opt-in for that session and workspace. On the first activation, if lifecycle Hooks are absent and no preference was saved, it asks whether to configure Hook enhanced mode.
-3. Continue normally. Every final reply ends with a visible usage status. At or above 75%, it also offers **是，生成交接文档 / 否，暂不生成**. At or above 85%, it shows the higher level. At or above 90%, trusted lifecycle Hooks finish the already-started atomic step, prevent another substantive tool call, and pause for that choice.
-4. Choose yes: the model immediately prepares factual task state and updates the project's current `HANDOFF.md`, `RESUME.txt`, and `checkpoint.json`. Choose no: no handoff is generated, and monitoring continues.
+3. Continue normally. Every final reply ends with a visible usage status. At or above 85%, it offers **yes, generate the handoff / no, not now**. At or above 90%, trusted lifecycle Hooks finish the already-started atomic step, prevent another substantive tool call, and pause for that choice.
+4. Choose yes: the model immediately prepares factual task state and updates the project's current `HANDOFF.md`, `RESUME.txt`, and `checkpoint.json`. The handoff and resume instructions follow the user's language (Chinese and English are supported). Choose no: no handoff is generated, and monitoring continues.
 
 Monitoring persists after compaction. A peak remains pending even when compaction lowers current usage. If compaction was observed without a usable peak, report compaction without guessing a percentage. Merely invoking the skill never creates a handoff.
 
@@ -40,7 +40,7 @@ Run with `python scripts/avoid_context_compaction.py` from the skill directory, 
 | `doctor --project <absolute-project>` | Inspect configured events and observed hook timestamps. |
 | `status` | Read current usage without enabling monitoring. |
 
-Session identity comes from CODEX_THREAD_ID or CODEX_SESSION_ID. Global flags (`--session-id`, `--codex-home`, `--transcript`, `--warn`, `--handoff`, `--stop`) go **before** the command. Keep manual and automatic thresholds consistent.
+Session identity comes from CODEX_THREAD_ID or CODEX_SESSION_ID. Global flags (`--session-id`, `--codex-home`, `--transcript`, `--handoff`, `--stop`) go **before** the command. Keep manual and automatic thresholds consistent.
 
 ## Saved data
 

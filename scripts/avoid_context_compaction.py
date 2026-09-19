@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_WARN = 0.75
 DEFAULT_HANDOFF = 0.85
 DEFAULT_STOP = 0.90
 DEFAULT_STALE_SECONDS = 300
@@ -82,7 +81,7 @@ def is_compaction_event(record: dict[str, Any]) -> bool:
     return top in known or inner in known
 
 
-def read_usage(transcript: Path, warn: float, handoff: float, stale_seconds: int,
+def read_usage(transcript: Path, handoff: float, stale_seconds: int,
                stop: float = DEFAULT_STOP) -> dict[str, Any]:
     latest: dict[str, Any] | None = None
     latest_line = 0
@@ -141,7 +140,6 @@ def read_usage(transcript: Path, warn: float, handoff: float, stale_seconds: int
     level = (
         "hard_stop" if conservative >= stop else
         "handoff" if conservative >= handoff else
-        "warning" if conservative >= warn else
         "ok"
     )
     if age is None or age > stale_seconds:
@@ -167,7 +165,7 @@ def usage_status(args: argparse.Namespace, transcript_override: str | None = Non
         transcript = find_transcript(codex_home(args.codex_home), sid)
     if transcript is None or not transcript.exists():
         return {"session_id": sid, "level": "unknown", "reason": "matching transcript not found", "transcript": str(transcript) if transcript else None}
-    result = read_usage(transcript, args.warn, args.handoff, args.stale_seconds, args.stop)
+    result = read_usage(transcript, args.handoff, args.stale_seconds, args.stop)
     result["session_id"] = sid
     return result
 
@@ -212,34 +210,64 @@ def validate_checkpoint(data: Any) -> dict[str, Any]:
             raise ValueError(f"{key} must be a list of strings")
     if data["status"] not in {"active", "ready", "complete"}:
         raise ValueError("status must be active, ready, or complete")
+    if "language" in data and (not isinstance(data["language"], str) or not data["language"].strip()):
+        raise ValueError("language must be a non-empty language tag")
     rendered = json.dumps(data, ensure_ascii=False)
     if SECRET_RE.search(rendered):
         raise ValueError("checkpoint appears to contain a secret; remove the secret value")
     return data
 
 
-def section(title: str, items: list[str]) -> str:
-    body = "\n".join(f"- {item}" for item in items) if items else "- 无"
+def checkpoint_language(data: dict[str, Any]) -> str:
+    explicit = str(data.get("language", "")).strip().lower()
+    if explicit:
+        return "zh" if explicit.startswith("zh") else "en"
+    sample = json.dumps({key: data.get(key) for key in ("task", "goal", *LIST_FIELDS)}, ensure_ascii=False)
+    return "zh" if re.search(r"[\u3400-\u9fff]", sample) else "en"
+
+
+def section(title: str, items: list[str], empty: str = "None") -> str:
+    body = "\n".join(f"- {item}" for item in items) if items else f"- {empty}"
     return f"## {title}\n\n{body}\n"
 
 
 def render_handoff(data: dict[str, Any], meta: dict[str, Any]) -> str:
     usage = meta.get("usage", {})
-    usage_line = "不可用"
+    language = checkpoint_language(data)
+    if language == "zh":
+        usage_line = "不可用"
+        if isinstance(usage.get("conservative_ratio"), float):
+            usage_line = f"{usage['conservative_ratio']:.1%}（最近快照；级别：{usage.get('level')}）"
+        parts = [
+            f"# {data['task']} — 任务交接\n",
+            f"- 保存时间：{meta['saved_at']}\n- 会话 ID：{meta['session_id']}\n- 项目：{meta['project']}\n- 状态：{data['status']}\n- 上下文用量：{usage_line}\n",
+            f"## 目标与完成标准\n\n{data['goal']}\n",
+            section("用户要求与纠正", data["requirements"], "无"),
+            section("已完成成果", data["completed"], "无"),
+            section("验证证据", data["verification"], "无"),
+            section("决定及原因", data["decisions"], "无"),
+            section("未完成工作与阻塞", data["remaining"], "无"),
+            section("下一步", data["next_steps"], "无"),
+            section("注意事项与权限边界", data["cautions"], "无"),
+            section("工作区与运行状态", data["workspace"], "无"),
+        ]
+        return "\n".join(parts).rstrip() + "\n"
+
+    usage_line = "Unavailable"
     if isinstance(usage.get("conservative_ratio"), float):
-        usage_line = f"{usage['conservative_ratio']:.1%}（最近快照，级别：{usage.get('level')}）"
+        usage_line = f"{usage['conservative_ratio']:.1%} (latest snapshot; level: {usage.get('level')})"
     parts = [
-        f"# {data['task']} — 任务交接\n",
-        f"- 保存时间：{meta['saved_at']}\n- 会话 ID：{meta['session_id']}\n- 项目：{meta['project']}\n- 状态：{data['status']}\n- 上下文用量：{usage_line}\n",
-        f"## 目标与完成标准\n\n{data['goal']}\n",
-        section("用户要求与纠正", data["requirements"]),
-        section("已完成成果", data["completed"]),
-        section("验证证据", data["verification"]),
-        section("决定及原因", data["decisions"]),
-        section("未完成工作与阻塞", data["remaining"]),
-        section("下一步", data["next_steps"]),
-        section("注意事项与权限边界", data["cautions"]),
-        section("工作区与运行状态", data["workspace"]),
+        f"# {data['task']} — Task Handoff\n",
+        f"- Saved at: {meta['saved_at']}\n- Session ID: {meta['session_id']}\n- Project: {meta['project']}\n- Status: {data['status']}\n- Context usage: {usage_line}\n",
+        f"## Goal and acceptance criteria\n\n{data['goal']}\n",
+        section("User requirements and corrections", data["requirements"]),
+        section("Completed work", data["completed"]),
+        section("Verification evidence", data["verification"]),
+        section("Decisions and rationale", data["decisions"]),
+        section("Remaining work and blockers", data["remaining"]),
+        section("Next steps", data["next_steps"]),
+        section("Cautions and authorization boundaries", data["cautions"]),
+        section("Workspace and running state", data["workspace"]),
     ]
     return "\n".join(parts).rstrip() + "\n"
 
@@ -305,13 +333,22 @@ def save_checkpoint(args: argparse.Namespace, monitor_path: Path, monitor_state:
     meta = {"saved_at": utcnow().isoformat(), "session_id": sid, "project": str(project), "usage": usage}
     handoff = render_handoff(data, meta)
     handoff_path, resume_path, checkpoint_path = current_handoff_targets(project)
-    resume = (
-        f"继续项目“{project}”中的任务“{data['task']}”。\n\n"
-        f"先完整读取交接文件：{handoff_path}\n"
-        "再读取适用的 AGENTS.md，并核对实际文件、工作区状态和验证证据。\n"
-        "保留交接中的用户要求、纠正和决定理由；区分已验证事实、未验证修改与假设。\n"
-        "如记录与实际状态不一致，先说明并核实差异，然后从“下一步”继续完成任务。\n"
-    )
+    if checkpoint_language(data) == "zh":
+        resume = (
+            f"继续项目“{project}”中的任务“{data['task']}”。\n\n"
+            f"先完整读取交接文件：{handoff_path}\n"
+            "再读取适用的 AGENTS.md，并核对实际文件、工作区状态和验证证据。\n"
+            "保留交接中的用户要求、纠正和决定理由；区分已验证事实、未验证修改与假设。\n"
+            "如记录与实际状态不一致，先说明并核实差异，然后从“下一步”继续完成任务。\n"
+        )
+    else:
+        resume = (
+            f"Continue the task \"{data['task']}\" in project \"{project}\".\n\n"
+            f"First, read the complete handoff file: {handoff_path}\n"
+            "Then read the applicable AGENTS.md and verify the actual files, workspace state, and evidence.\n"
+            "Preserve the user's requirements, corrections, and decision rationale; distinguish verified facts, unverified changes, and assumptions.\n"
+            "If the record differs from the actual state, explain and verify the discrepancy before continuing from Next steps.\n"
+        )
     atomic_json(checkpoint_path, {"meta": meta, "checkpoint": data})
     atomic_text(handoff_path, handoff)
     atomic_text(resume_path, resume)
@@ -346,7 +383,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--codex-home")
     parser.add_argument("--session-id")
     parser.add_argument("--transcript")
-    parser.add_argument("--warn", type=float, default=DEFAULT_WARN)
     parser.add_argument("--handoff", type=float, default=DEFAULT_HANDOFF)
     parser.add_argument("--stop", type=float, default=DEFAULT_STOP)
     parser.add_argument("--stale-seconds", type=int, default=DEFAULT_STALE_SECONDS)
@@ -370,8 +406,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     configure_stdio()
     args = build_parser().parse_args()
-    if not 0 < args.warn < args.handoff < args.stop < 1:
-        print("thresholds must satisfy 0 < warn < handoff < stop < 1", file=sys.stderr)
+    if not 0 < args.handoff < args.stop < 1:
+        print("thresholds must satisfy 0 < handoff < stop < 1", file=sys.stderr)
         return 2
     try:
         if args.command == "status":
@@ -389,7 +425,7 @@ def main() -> int:
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         if args.command == "hook":
             # Stop exit code 2 means "continue the turn"; diagnostics must not loop.
-            print(json.dumps({"systemMessage": f"上下文监测失败，自动提醒尚未验证：{exc}"}, ensure_ascii=False))
+            print(json.dumps({"systemMessage": f"Context monitoring failed; automatic reminders remain unverified: {exc}"}, ensure_ascii=False))
             return 0
         print(f"avoid-context-compaction: {exc}", file=sys.stderr)
         return 2

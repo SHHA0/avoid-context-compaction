@@ -119,9 +119,9 @@ class MonitorTests(unittest.TestCase):
         self.assertIsNone(self.hook("Stop", last_assistant_message="done\n" + normal_footer))
         self.append(.75)
         self.assertIsNone(self.hook("PostToolUse"))
-        warning = self.command("final-check")["footer"]
-        self.assertIn("75%", warning)
-        self.assertIn("是否生成交接文档", warning)
+        below_threshold = self.command("final-check")["footer"]
+        self.assertIn("below the 85% handoff threshold", below_threshold)
+        self.assertNotIn("Generate a handoff?", below_threshold)
         self.append(.85)
         result = self.hook("Stop", last_assistant_message="done")
         self.assertEqual(result["decision"], "block")
@@ -132,7 +132,7 @@ class MonitorTests(unittest.TestCase):
         self.assertNotIn("decision", guarded)
 
     def test_correct_final_footer_does_not_extend_turn(self):
-        self.append(.80)
+        self.append(.86)
         self.command("activate")
         footer = self.command("final-check")["footer"]
         self.assertIsNone(self.hook("Stop", last_assistant_message="done\n" + footer))
@@ -163,8 +163,8 @@ class MonitorTests(unittest.TestCase):
         self.assertTrue(self.state()["hard_stop_pending"])
 
         reminder = self.command("final-check")["footer"]
-        self.assertIn("90% 硬停止线", reminder)
-        self.assertIn("当前任务已在安全边界暂停", reminder)
+        self.assertIn("90% hard-stop threshold", reminder)
+        self.assertIn("paused at a safe boundary", reminder)
         self.append(.92)
         self.assertIsNone(self.hook("Stop", last_assistant_message="paused\n" + reminder))
 
@@ -180,18 +180,18 @@ class MonitorTests(unittest.TestCase):
         self.assertFalse(self.state()["hard_stop_pending"])
 
     def test_manual_fallback_resumes_after_decline_on_next_user_message(self):
-        self.append(.80)
+        self.append(.86)
         self.command("activate")
         self.command("decision", "--choice", "no")
         with self.transcript.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps({"timestamp": core.utcnow().isoformat(), "type": "event_msg",
                                      "payload": {"type": "user_message", "message": "next task"}}) + "\n")
-        self.assertIn("是否生成交接文档", self.command("final-check")["footer"])
+        self.assertIn("Generate a handoff?", self.command("final-check")["footer"])
 
     def test_missed_peak_survives_compaction_before_next_hook(self):
         self.append(.63)
         self.command("activate")
-        self.append(.76)
+        self.append(.84)
         self.append(.88)
         self.append(compact=True)
         self.append(.20)
@@ -207,7 +207,7 @@ class MonitorTests(unittest.TestCase):
         self.command("activate")
         self.hook("PreCompact")
         self.append(compact=True)
-        self.assertIn("是否生成交接文档", self.command("final-check")["footer"])
+        self.assertIn("Generate a handoff?", self.command("final-check")["footer"])
         restored = self.hook("SessionStart", source="compact")
         self.assertIn("final-check", restored["hookSpecificOutput"]["additionalContext"])
 
@@ -221,30 +221,30 @@ class MonitorTests(unittest.TestCase):
         self.assertFalse(self.state().get("pending_compaction"))
 
     def test_decline_suppresses_choice_turn_but_monitors_next_request(self):
-        self.append(.80)
+        self.append(.86)
         self.command("activate")
         self.command("decision", "--choice", "no")
         self.assertEqual(self.command("final-check")["footer"], "")
         self.assertIsNone(self.hook("Stop", last_assistant_message="declined"))
         self.hook("UserPromptSubmit", prompt="continue work")
-        self.assertIn("75%", self.command("final-check")["footer"])
-        self.append(.86)
+        self.assertIn("85%", self.command("final-check")["footer"])
+        self.append(.87)
         self.assertIn("85%", self.command("final-check")["footer"])
         self.assertFalse(list(self.project.rglob("HANDOFF.md")))
 
     def test_unrelated_prompt_never_grants_consent(self):
-        self.append(.80)
+        self.append(.86)
         self.command("activate")
         self.hook("UserPromptSubmit", prompt="fix another issue")
         self.assertFalse(self.state().get("approved"))
         self.assertTrue(self.state()["awaiting_choice"])
 
     def test_consent_required_and_consumed_only_after_successful_generation(self):
-        self.append(.80)
+        self.append(.86)
         self.command("activate")
         source = self.root / "input.json"
         data = {k: [] for k in core.LIST_FIELDS}
-        data.update(task="测试交接", goal="Keep real evidence", status="ready")
+        data.update(language="zh-CN", task="测试交接", goal="保留真实证据", status="ready")
         source.write_text(json.dumps(data), encoding="utf-8")
         command = [sys.executable, "-B", str(Path(core.__file__)), *self.global_args,
                    "checkpoint", "--project", str(self.project), "--input", str(source)]
@@ -292,12 +292,12 @@ class MonitorTests(unittest.TestCase):
 
     def test_missing_and_stale_usage_is_visible_not_reported_safe(self):
         unknown = self.command("activate")
-        self.assertIn("不可确认", unknown["footer"])
+        self.assertIn("current usage is unknown", unknown["footer"])
         old = (core.utcnow() - dt.timedelta(minutes=10)).isoformat()
         self.append(.60, stamp=old)
         result = self.command("final-check")
         self.assertEqual(result["usage"]["level"], "stale")
-        self.assertIn("不可确认", result["footer"])
+        self.assertIn("current usage is unknown", result["footer"])
 
     def test_final_check_reports_normal_usage_and_records_evidence(self):
         self.append(.40)
@@ -305,7 +305,7 @@ class MonitorTests(unittest.TestCase):
         self.command("final-check")
         result = self.command("final-check")
         self.assertIn("40.0%", result["footer"])
-        self.assertIn("未达到 75%", result["footer"])
+        self.assertIn("below the 85% handoff threshold", result["footer"])
         self.assertEqual(result["final_check_count"], 2)
         self.assertIsNotNone(result["last_final_check"])
 

@@ -41,7 +41,7 @@ class ContextGuardTests(unittest.TestCase):
             transcript = Path(temp) / "rollout-session-a.jsonl"
             now = cg.utcnow().isoformat()
             self.write_jsonl(transcript, [event(now, 100, 10), event(now, 800, 60)])
-            result = cg.read_usage(transcript, 0.75, 0.85, 300)
+            result = cg.read_usage(transcript, 0.85, 300)
             self.assertEqual(result["level"], "handoff")
             self.assertEqual(result["input_tokens"], 800)
             self.assertAlmostEqual(result["conservative_ratio"], 0.86)
@@ -50,7 +50,7 @@ class ContextGuardTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             transcript = Path(temp) / "rollout-session-a.jsonl"
             self.write_jsonl(transcript, [event(cg.utcnow().isoformat(), 900, 10)])
-            result = cg.read_usage(transcript, 0.75, 0.85, 300, 0.90)
+            result = cg.read_usage(transcript, 0.85, 300, 0.90)
             self.assertEqual(result["level"], "hard_stop")
             self.assertAlmostEqual(result["conservative_ratio"], 0.91)
 
@@ -58,7 +58,7 @@ class ContextGuardTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             transcript = Path(temp) / "rollout-session-a.jsonl"
             self.write_jsonl(transcript, [event(cg.utcnow().isoformat(), 700, 0), {"type": "event_msg", "payload": {"type": "compacted"}}])
-            result = cg.read_usage(transcript, 0.75, 0.85, 300)
+            result = cg.read_usage(transcript, 0.85, 300)
             self.assertEqual(result["level"], "unknown")
             self.assertIn("predates compaction", result["reason"])
 
@@ -98,6 +98,7 @@ class ContextGuardTests(unittest.TestCase):
             self.assertEqual(first_result["handoff"], second_result["handoff"])
             self.assertTrue(Path(second_result["resume"]).exists())
             self.assertIn("Update guard", Path(second_result["handoff"]).read_text(encoding="utf-8"))
+            self.assertIn("Task Handoff", Path(second_result["handoff"]).read_text(encoding="utf-8"))
             self.assertEqual(len(list((project / cg.DATA_DIR_NAME).rglob("HANDOFF.md"))), 1)
 
             home = root / "codex-home"
@@ -162,6 +163,21 @@ class ContextGuardTests(unittest.TestCase):
             self.assertIn("Updated task", handoff.read_text(encoding="utf-8"))
             pointer = json.loads((project / cg.DATA_DIR_NAME / "current.json").read_text(encoding="utf-8"))
             self.assertEqual(Path(pointer["checkpoint"]), checkpoint)
+
+    def test_chinese_checkpoint_generates_chinese_handoff_and_resume(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            project = root / "project"
+            project.mkdir()
+            input_file = root / "input.json"
+            data = {key: [] for key in cg.LIST_FIELDS}
+            data.update(language="zh-CN", task="修复监测", goal="保留任务状态", status="ready")
+            input_file.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            env = dict(os.environ, CODEX_THREAD_ID="chinese-session")
+            command = [sys.executable, str(SCRIPT), "checkpoint", "--input", str(input_file), "--project", str(project)]
+            result = json.loads(subprocess.run(command, env=env, check=True, capture_output=True, text=True).stdout)
+            self.assertIn("任务交接", Path(result["handoff"]).read_text(encoding="utf-8"))
+            self.assertIn("继续项目", Path(result["resume"]).read_text(encoding="utf-8"))
 
     def test_basic_install_preserves_agents_and_does_not_create_hooks(self):
         with tempfile.TemporaryDirectory() as temp:
