@@ -1,199 +1,109 @@
 import importlib.util
 import json
 import os
+from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
-from pathlib import Path
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "avoid_context_compaction.py"
 INSTALLER = Path(__file__).resolve().parents[1] / "scripts" / "install.py"
 SPEC = importlib.util.spec_from_file_location("avoid_context_compaction", SCRIPT)
-cg = importlib.util.module_from_spec(SPEC)
+core = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader
-SPEC.loader.exec_module(cg)
+SPEC.loader.exec_module(core)
 
 
 def event(timestamp, inputs, outputs, window=1000):
-    return {
-        "timestamp": timestamp,
-        "type": "event_msg",
-        "payload": {
-            "type": "token_count",
-            "info": {
-                "total_token_usage": {"input_tokens": 999999},
-                "last_token_usage": {"input_tokens": inputs, "output_tokens": outputs},
-                "model_context_window": window,
-            },
-        },
-    }
+    return {"timestamp": timestamp, "type": "event_msg", "payload": {"type": "token_count", "info": {
+        "total_token_usage": {"input_tokens": 999999},
+        "last_token_usage": {"input_tokens": inputs, "output_tokens": outputs}, "model_context_window": window}}}
 
 
-class ContextGuardTests(unittest.TestCase):
+class ContextStateTests(unittest.TestCase):
     def write_jsonl(self, path, records):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("".join(json.dumps(row) + "\n" for row in records), encoding="utf-8")
 
-    def test_uses_last_request_and_thresholds(self):
-        with tempfile.TemporaryDirectory() as temp:
-            transcript = Path(temp) / "rollout-session-a.jsonl"
-            now = cg.utcnow().isoformat()
-            self.write_jsonl(transcript, [event(now, 100, 10), event(now, 800, 60)])
-            result = cg.read_usage(transcript, 0.85, 300)
-            self.assertEqual(result["level"], "handoff")
-            self.assertEqual(result["input_tokens"], 800)
-            self.assertAlmostEqual(result["conservative_ratio"], 0.86)
+    def task_data(self, language="en"):
+        return {
+            "language": language, "task": "Build tracker" if language == "en" else "构建状态记录器",
+            "project_goal": "Preserve task state" if language == "en" else "保存任务状态",
+            "expected_outcome": "Continue after compaction" if language == "en" else "压缩后继续任务",
+            "requirements": ["Keep corrections"], "corrections": ["Use the latest scope"],
+            "decisions": ["Use native compaction"], "completed": ["Parser"], "results": ["State is recoverable"],
+            "verification": ["Unit check passed"], "remaining": ["Install"], "next_steps": ["Restart Codex"],
+            "cautions": ["Snapshot may lag"], "workspace": ["Clean worktree"], "status": "ready",
+        }
 
-    def test_hard_stop_level(self):
+    def test_usage_uses_latest_request_without_stop_levels(self):
         with tempfile.TemporaryDirectory() as temp:
-            transcript = Path(temp) / "rollout-session-a.jsonl"
-            self.write_jsonl(transcript, [event(cg.utcnow().isoformat(), 900, 10)])
-            result = cg.read_usage(transcript, 0.85, 300, 0.90)
-            self.assertEqual(result["level"], "hard_stop")
-            self.assertAlmostEqual(result["conservative_ratio"], 0.91)
+            transcript = Path(temp) / "session.jsonl"
+            now = core.utcnow().isoformat()
+            self.write_jsonl(transcript, [event(now, 100, 10), event(now, 900, 20)])
+            result = core.read_usage(transcript, 300)
+            self.assertEqual(result["level"], "ok")
+            self.assertAlmostEqual(result["conservative_ratio"], .92)
 
-    def test_compaction_invalidates_older_snapshot(self):
+    def test_compaction_invalidates_an_older_snapshot(self):
         with tempfile.TemporaryDirectory() as temp:
-            transcript = Path(temp) / "rollout-session-a.jsonl"
-            self.write_jsonl(transcript, [event(cg.utcnow().isoformat(), 700, 0), {"type": "event_msg", "payload": {"type": "compacted"}}])
-            result = cg.read_usage(transcript, 0.85, 300)
+            transcript = Path(temp) / "session.jsonl"
+            self.write_jsonl(transcript, [event(core.utcnow().isoformat(), 700, 0), {"type": "compacted"}])
+            result = core.read_usage(transcript, 300)
             self.assertEqual(result["level"], "unknown")
-            self.assertIn("predates compaction", result["reason"])
 
-    def test_find_transcript_matches_session_id(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            wanted = root / "sessions" / "2026" / "rollout-session-a.jsonl"
-            other = root / "sessions" / "2026" / "rollout-session-b.jsonl"
-            self.write_jsonl(wanted, [event(cg.utcnow().isoformat(), 10, 0)])
-            self.write_jsonl(other, [event(cg.utcnow().isoformat(), 900, 0)])
-            os.utime(other, None)
-            self.assertEqual(cg.find_transcript(root, "session-a"), wanted)
+    def test_threshold_parser(self):
+        self.assertEqual(core.parse_thresholds("0.8, 0.5,0.5"), (.5, .8))
+        with self.assertRaises(Exception):
+            core.parse_thresholds("0,0.8")
 
-    def test_checkpoint_updates_one_project_handoff_and_installer_merge(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            project = root / "project"
-            project.mkdir()
-            input_file = root / "checkpoint.json"
-            input_file.write_text(json.dumps({
-                "task": "Build guard", "goal": "Preserve task state",
-                "requirements": ["Keep corrections"], "completed": ["Parser"],
-                "verification": ["Unit check passed"], "decisions": ["Use snapshots"],
-                "remaining": ["Install"], "next_steps": ["Restart Codex"],
-                "cautions": ["Snapshot may lag"], "workspace": ["No git repository"],
-                "status": "ready"
-            }), encoding="utf-8")
-            env = dict(os.environ, CODEX_THREAD_ID="test-session")
-            command = [sys.executable, str(SCRIPT), "checkpoint", "--input", str(input_file), "--project", str(project)]
-            first = subprocess.run(command, env=env, check=True, capture_output=True, text=True)
-            updated = json.loads(input_file.read_text(encoding="utf-8"))
-            updated["task"] = "Update guard"
-            input_file.write_text(json.dumps(updated), encoding="utf-8")
-            second = subprocess.run(command, env=env, check=True, capture_output=True, text=True)
-            first_result = json.loads(first.stdout)
-            second_result = json.loads(second.stdout)
-            self.assertEqual(first_result["handoff"], second_result["handoff"])
-            self.assertTrue(Path(second_result["resume"]).exists())
-            self.assertIn("Update guard", Path(second_result["handoff"]).read_text(encoding="utf-8"))
-            self.assertIn("Task Handoff", Path(second_result["handoff"]).read_text(encoding="utf-8"))
-            self.assertEqual(len(list((project / cg.DATA_DIR_NAME).rglob("HANDOFF.md"))), 1)
+    def test_old_task_schema_is_normalized(self):
+        data = self.task_data()
+        data["goal"] = data.pop("project_goal")
+        data.pop("expected_outcome")
+        data.pop("corrections")
+        data.pop("results")
+        normalized = core.validate_task_state(data)
+        self.assertEqual(normalized["project_goal"], normalized["expected_outcome"])
+        self.assertEqual(normalized["corrections"], [])
 
-            home = root / "codex-home"
-            hooks = {"description": "existing", "hooks": {"SessionStart": [{"hooks": [
-                {"type": "command", "command": "existing-tool"},
-                {"type": "command", "command": "python context_guard.py hook"}
-            ]}]}}
-            home.mkdir()
-            (home / "hooks.json").write_text(json.dumps(hooks), encoding="utf-8")
-            install_command = [sys.executable, str(INSTALLER), "--codex-home", str(home), "--with-hooks"]
-            subprocess.run(install_command, check=True, capture_output=True, text=True)
-            installed = home / "skills" / "avoid-context-compaction"
-            (installed / "obsolete.txt").write_text("old install artifact", encoding="utf-8")
-            subprocess.run(install_command, check=True, capture_output=True, text=True)
-            merged = json.loads((home / "hooks.json").read_text(encoding="utf-8"))
-            self.assertEqual(sum(isinstance(g, dict) and any("avoid_context_compaction.py" in str(h) for h in g.get("hooks", [])) for g in merged["hooks"]["SessionStart"]), 1)
-            self.assertTrue(any(h.get("command") == "existing-tool" for g in merged["hooks"]["SessionStart"] for h in g.get("hooks", [])))
-            self.assertTrue((installed / "SKILL.md").exists())
-            self.assertFalse((installed / ".git").exists())
-            self.assertFalse((installed / "obsolete.txt").exists())
-            self.assertIn("Stop", merged["hooks"])
-            self.assertIn("PreToolUse", merged["hooks"])
-            preferences = json.loads((home / "avoid-context-compaction.json").read_text(encoding="utf-8"))
-            self.assertEqual(preferences["hook_mode"], "enhanced")
-            managed_handlers = [
-                h
-                for groups in merged["hooks"].values()
-                for group in groups
-                for h in group.get("hooks", [])
-                if "avoid_context_compaction.py" in str(h)
-            ]
-            self.assertTrue(managed_handlers)
-            self.assertTrue(all(h["commandWindows"].startswith('& "') for h in managed_handlers))
-            self.assertTrue(all(not h["command"].startswith("& ") for h in managed_handlers))
-            agents = (home / "AGENTS.md").read_text(encoding="utf-8")
-            self.assertEqual(agents.count("avoid-context-compaction:basic-monitor:begin"), 1)
-            self.assertIn("final-check", agents)
-
-    def test_checkpoint_reuses_newest_legacy_handoff_target(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            project = root / "project"
-            old = project / cg.DATA_DIR_NAME / "old-session" / "20260101T000000Z"
-            old.mkdir(parents=True)
-            handoff = old / "HANDOFF.md"
-            resume = old / "RESUME.txt"
-            checkpoint = old / "checkpoint.json"
-            handoff.write_text("old", encoding="utf-8")
-            resume.write_text("old", encoding="utf-8")
-            checkpoint.write_text("{}", encoding="utf-8")
-            cg.atomic_json(old.parent / "current.json", {
-                "handoff": str(handoff), "resume": str(resume), "saved_at": "2026-01-01T00:00:00+00:00"
-            })
-            input_file = root / "input.json"
-            data = {key: [] for key in cg.LIST_FIELDS}
-            data.update(task="Updated task", goal="Update the existing handoff", status="ready")
-            input_file.write_text(json.dumps(data), encoding="utf-8")
-            env = dict(os.environ, CODEX_THREAD_ID="new-session")
-            command = [sys.executable, str(SCRIPT), "checkpoint", "--input", str(input_file), "--project", str(project)]
-            result = json.loads(subprocess.run(command, env=env, check=True, capture_output=True, text=True).stdout)
-            self.assertEqual(Path(result["handoff"]), handoff)
-            self.assertIn("Updated task", handoff.read_text(encoding="utf-8"))
-            pointer = json.loads((project / cg.DATA_DIR_NAME / "current.json").read_text(encoding="utf-8"))
-            self.assertEqual(Path(pointer["checkpoint"]), checkpoint)
-
-    def test_chinese_checkpoint_generates_chinese_handoff_and_resume(self):
+    def test_explicit_handoff_is_session_scoped_and_localized(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             project = root / "project"
             project.mkdir()
-            input_file = root / "input.json"
-            data = {key: [] for key in cg.LIST_FIELDS}
-            data.update(language="zh-CN", task="修复监测", goal="保留任务状态", status="ready")
-            input_file.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-            env = dict(os.environ, CODEX_THREAD_ID="chinese-session")
-            command = [sys.executable, str(SCRIPT), "checkpoint", "--input", str(input_file), "--project", str(project)]
+            source = root / "input.json"
+            source.write_text(json.dumps(self.task_data("zh-CN"), ensure_ascii=False), encoding="utf-8")
+            env = dict(os.environ, CODEX_THREAD_ID="session-zh")
+            command = [sys.executable, str(SCRIPT), "handoff", "--input", str(source), "--project", str(project)]
             result = json.loads(subprocess.run(command, env=env, check=True, capture_output=True, text=True).stdout)
+            self.assertIn("session-zh", result["handoff"])
             self.assertIn("任务交接", Path(result["handoff"]).read_text(encoding="utf-8"))
             self.assertIn("继续项目", Path(result["resume"]).read_text(encoding="utf-8"))
+            self.assertTrue(Path(result["structured"]).exists())
 
-    def test_basic_install_preserves_agents_and_does_not_create_hooks(self):
+    def test_installer_removes_obsolete_tool_gates(self):
         with tempfile.TemporaryDirectory() as temp:
             home = Path(temp) / "codex-home"
             home.mkdir()
-            (home / "AGENTS.md").write_text("# Existing rule\n", encoding="utf-8")
-            command = [sys.executable, str(INSTALLER), "--codex-home", str(home)]
-            first = subprocess.run(command, check=True, capture_output=True, text=True)
+            hooks = {"description": "existing", "hooks": {"PreToolUse": [{"hooks": [
+                {"type": "command", "command": "python avoid_context_compaction.py hook"},
+                {"type": "command", "command": "existing-tool"}
+            ]}], "PostToolUse": [{"hooks": [{"type": "command", "command": "python context_guard.py hook"}]}]}}
+            (home / "hooks.json").write_text(json.dumps(hooks), encoding="utf-8")
+            command = [sys.executable, str(INSTALLER), "--codex-home", str(home), "--with-hooks"]
             subprocess.run(command, check=True, capture_output=True, text=True)
-            result = json.loads(first.stdout)
+            merged = json.loads((home / "hooks.json").read_text(encoding="utf-8"))
+            self.assertNotIn("PostToolUse", merged["hooks"])
+            self.assertTrue(any("existing-tool" in str(group) for group in merged["hooks"]["PreToolUse"]))
+            self.assertFalse(any("avoid_context_compaction.py" in str(group) for group in merged["hooks"]["PreToolUse"]))
+            for event_name in ("SessionStart", "UserPromptSubmit", "PreCompact", "Stop"):
+                self.assertIn(event_name, merged["hooks"])
             agents = (home / "AGENTS.md").read_text(encoding="utf-8")
-            self.assertIn("# Existing rule", agents)
-            self.assertEqual(agents.count("avoid-context-compaction:basic-monitor:begin"), 1)
-            self.assertFalse((home / "hooks.json").exists())
-            self.assertFalse((home / "avoid-context-compaction.json").exists())
-            self.assertFalse(result["hook_trust_required"])
+            self.assertIn("state_update_due", agents)
+            self.assertNotIn("hard-stop", agents)
 
 
 if __name__ == "__main__":

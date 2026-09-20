@@ -13,7 +13,8 @@ import tempfile
 from pathlib import Path
 
 
-EVENTS = ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PreCompact", "Stop")
+EVENTS = ("SessionStart", "UserPromptSubmit", "PreCompact", "Stop")
+MANAGED_EVENTS = EVENTS + ("PreToolUse", "PostToolUse")
 INSTALL_IGNORES = (".git", ".avoid-context-compaction", ".context-guard", "__pycache__", "*.pyc")
 BASIC_BEGIN = "<!-- avoid-context-compaction:basic-monitor:begin -->"
 BASIC_END = "<!-- avoid-context-compaction:basic-monitor:end -->"
@@ -59,9 +60,9 @@ def install_basic_instructions(home: Path, executable: Path, script: Path) -> Pa
 For the main agent only, immediately before every final response:
 
 1. Run `{command}`, replacing `<current-workspace-root>` with the absolute workspace root for the active task.
-2. If the command reports `enabled: true`, append its nonempty `footer` verbatim at the very end of the final response. This includes the normal below-threshold status, so the user can verify that the check ran.
-3. If the footer asks whether to generate a handoff, wait for the user's actual choice. On yes, follow the installed `$avoid-context-compaction` skill to record consent and generate it immediately. On no, record the choice and generate nothing.
-4. At the 90% hard-stop line, finish only the already-started atomic step, stop the current task at a safe boundary, append the footer, and wait for the user's choice. Do not start another substantive step.
+2. If the command reports `state_update_due: true`, follow the installed `$avoid-context-compaction` skill to write the factual task state, then run `final-check` again.
+3. Append only the returned nonempty `footer` verbatim at the very end of the final response. Do not add threshold commentary or stop the task because of a context percentage.
+4. Generate a detailed handoff and copyable resume prompt only when the user explicitly requests one.
 
 If monitoring is not enabled for the current session/workspace, do nothing. Do not claim that lifecycle Hooks are running unless `doctor` reports an observed Stop event.
 {BASIC_END}"""
@@ -119,7 +120,7 @@ def main() -> int:
             existing = json.loads(hooks_path.read_text(encoding="utf-8-sig"))
             if not isinstance(existing, dict) or not isinstance(existing.get("hooks"), dict):
                 raise ValueError(f"unsupported hooks file structure: {hooks_path}")
-        for event in EVENTS:
+        for event in MANAGED_EVENTS:
             groups = existing["hooks"].setdefault(event, [])
             preserved = []
             for group in groups:
@@ -130,7 +131,10 @@ def main() -> int:
                 if remaining:
                     preserved.append({**group, "hooks": remaining})
             groups[:] = preserved
-            groups.extend(template["hooks"][event])
+            if event in EVENTS:
+                groups.extend(template["hooks"][event])
+            elif not groups:
+                existing["hooks"].pop(event, None)
         command = f'"{executable}" "{installed_script}" hook'
         command_windows = f'& "{executable}" "{installed_script}" hook'
         for event in EVENTS:

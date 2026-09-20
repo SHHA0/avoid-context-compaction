@@ -1,28 +1,29 @@
-# Checkpoint input
+# Task-state and handoff input
 
-In a monitored session, generate these files only after the user chooses yes (or explicitly requests a handoff). Record that choice with `decision --choice yes --project <absolute-project>` first. Enabling the skill or reaching a threshold does not authorize a checkpoint. One successful generation consumes the recorded choice; failed attempts can be retried.
-
-Use a UTF-8 JSON object with the following schema. `language` is optional for compatibility; all other fields are required:
+Use this schema for both threshold task-state updates and user-requested handoffs. Supply factual state in the user's language; do not copy secrets, entire transcripts, or unsupported claims.
 
 ```json
 {
   "language": "BCP 47 tag matching the user's language, for example zh-CN or en",
-  "task": "Task name",
-  "goal": "Original objective and acceptance criteria",
-  "requirements": ["Explicit user constraint, its scope and reason"],
-  "completed": ["Delivered file or result, with location"],
-  "verification": ["Command/check, outcome, time and relevant version; say untested when appropriate"],
-  "decisions": ["Decision and reason; rejected approaches and why"],
+  "task": "Short task name",
+  "project_goal": "The current project objective and acceptance criteria",
+  "expected_outcome": "The observable result the user expects",
+  "requirements": ["Explicit constraints and their scope"],
+  "corrections": ["User corrections or changed requirements, preserving the latest instruction"],
+  "decisions": ["Decision, reason, and rejected approach when relevant"],
+  "completed": ["Delivered work with paths or identifiers"],
+  "results": ["Current task effects or observed outcomes"],
+  "verification": ["Check, outcome, time, and relevant version; say untested when appropriate"],
   "remaining": ["Outstanding work or blocker"],
   "next_steps": ["Concrete next action"],
-  "cautions": ["Unverified assumptions, authorization limits, risks"],
-  "workspace": ["Branch and uncommitted changes if relevant; running jobs and IDs"],
+  "cautions": ["Unverified assumptions, authorization limits, and risks"],
+  "workspace": ["Branch, uncommitted changes, running jobs, and operation IDs"],
   "status": "active"
 }
 ```
 
-`language` controls the generated `HANDOFF.md` headings and `RESUME.txt` instructions so they match the user's language. Chinese (`zh` tags) and English are currently supported. For compatibility with older checkpoint files, the field is optional; when omitted, the script detects Chinese text and otherwise uses English. `status` is `active`, `ready`, or `complete`. Empty lists are allowed when nothing applies. Do not fill fields with fictional evidence. `ready` means the record is ready for handoff, not that the task is complete.
+All fields except `language` are required. `status` is `active`, `ready`, or `complete`. Empty lists are allowed. The script accepts the older `goal` field as `project_goal`, defaults `expected_outcome` to that goal, and treats missing `corrections` or `results` as empty for compatibility.
 
-Each save atomically updates one project-wide `HANDOFF.md`, `RESUME.txt`, and `checkpoint.json` set. `current.json` points to that set. On the first save after an upgrade, the script reuses the newest valid legacy handoff target when one exists. The generated `RESUME.txt` identifies the task and exact handoff path. Recovery also recognizes the legacy `.context-guard` directory so existing handoffs are not lost after an upgrade.
+At a 50% or 80% threshold, update only the current conversation's `TASK_STATE.md` and `state.json`. Preserve useful earlier facts while incorporating later corrections and evidence. One update at 80% also satisfies an unprocessed 50% crossing in that cycle.
 
-On recovery read the handoff, relevant AGENTS.md and referenced evidence. Check actual files and worktree state. State important discrepancies and resolve them before relying on old verification. Preserve user corrections over older decisions, without silently extending their scope.
+For an explicit handoff request, make the record detailed enough for another conversation to continue without guessing. The generated `RESUME.txt` points to the exact `HANDOFF.md`; the new conversation must verify actual files, workspace state, and interrupted operations before continuing.

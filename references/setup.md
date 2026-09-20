@@ -1,54 +1,33 @@
 # Setup and verification
 
-Run `python <skill>/scripts/install.py` to copy the skill into `CODEX_HOME/skills/avoid-context-compaction` and install a marked basic-monitor block in `CODEX_HOME/AGENTS.md`. It preserves unrelated instructions and supports upgrades from `context-guard`.
+Run `python <skill>/scripts/install.py` to copy the skill into `CODEX_HOME/skills/avoid-context-compaction` and update its marked block in `CODEX_HOME/AGENTS.md`. Restart Codex, then invoke the skill in the intended conversation. Installation alone does not activate monitoring.
 
-Restart Codex so the global instruction is loaded. Basic mode requires no Hook trust. It asks the main agent to run `final-check` before every final response; normal checks return a visible percentage, while threshold checks also offer a handoff.
-
-Installation does not activate all conversations. Invoke the skill once in the intended conversation so it runs `activate --project <absolute-session-project>`. State is scoped to that session ID and the session working directory. A new conversation must opt in separately. When changing the session's project directory, activate there too; do not pick another project's latest state.
-
-On the first activation, `activate` checks both installed Hook definitions and the global preference at `<CODEX_HOME>/avoid-context-compaction.json`. If Hooks are absent and no choice exists, the agent asks whether to use Hook enhanced mode. `hook-mode --choice basic` permanently selects the default mode and suppresses future Hook prompts; `hook-mode --choice enhanced` records the request and returns the steps below; `hook-mode --choice ask` resets the preference. This preference is global, while activation and usage state remain session/project scoped.
+Basic mode asks the main agent to run `final-check` before every final reply. A due 50% or 80% update is written before the reply, then the final check is repeated. The visible reply ends with only the current usage sentence.
 
 ## Optional lifecycle Hooks
 
-Install them with `python <skill>/scripts/install.py --with-hooks`, restart Codex, then review/trust the updated definitions in the client (CLI: `/hooks`). Do not write trust records or bypass Hook trust. See [official Hooks documentation](https://learn.chatgpt.com/zh-Hans/docs/hooks).
-
-The enhanced-mode choice does not silently install or trust anything. Its returned procedure is:
-
-1. Run the displayed absolute `install.py --codex-home ... --with-hooks` command.
-2. Restart Codex.
-3. Open `/hooks`, review the avoid-context-compaction handlers, and explicitly trust them.
-4. Invoke the skill in the intended conversation and run `doctor`; verify real `Stop`, `PreToolUse`, and `PostToolUse` timestamps.
-
-Hooks add these guards:
+Install with `python <skill>/scripts/install.py --with-hooks`, restart, then review and explicitly trust the handlers in `/hooks`. The installer removes obsolete managed `PreToolUse` and `PostToolUse` handlers from older releases.
 
 | Event | Enabled-session behavior |
 | --- | --- |
-| UserPromptSubmit | Reinject monitoring instructions on each request; retain unanswered offers. |
-| PreToolUse | At 90%, deny new substantive tool calls while allowing monitor/decision/checkpoint control commands. |
-| PostToolUse | Record threshold peaks; at 90%, mark the completed tool as the safe stopping boundary and tell the agent to finalize. |
-| PreCompact | Persist a pending compaction reminder without blocking work. |
-| SessionStart | Restore monitoring instructions and the exact existing handoff path, if any. |
-| Stop | Check current/pending usage and final text; request one short continuation if the footer was missed. |
+| UserPromptSubmit | Reinject the monitoring workflow and any due state-update notice. |
+| PreCompact | Start a new threshold cycle without blocking work. |
+| SessionStart | Restore instructions and identify saved task state when present. |
+| Stop | Request one short continuation when a state update or footer was omitted. |
 
-Stop uses `decision: "block"` plus `reason` to ask for a continuation, not to abort the task. `stop_hook_active` and a per-turn ID prevent correction loops. If the continuation still omits the footer, emit a hook warning and stop retrying. Hooks cannot directly edit displayed final messages or create arbitrary choice buttons.
+Stop uses `decision: "block"` to request a continuation, not to cancel the task. A turn ID and `stop_hook_active` prevent correction loops. Hooks never deny tool use because of context percentage.
 
-## Diagnose before claiming success
+## Diagnose
 
-Run `python <skill>/scripts/avoid_context_compaction.py doctor --project <absolute-session-project>`.
+Run `python <skill>/scripts/avoid_context_compaction.py doctor --project <absolute-project>`.
 
-- `basic_instructions_configured` confirms the marked global instruction exists.
-- `last_final_check` and `final_check_count` provide evidence that final checks were run.
-- `missing_events` lists absent configured handlers, including Stop.
-- `observed_events` stores actual event timestamps received by this script for this enabled session.
-- `automatic_monitoring: unverified` means no Stop execution was observed. Configuration alone does not establish trust or runtime support.
-- `hard_stop_enforcement: unverified` means both PreToolUse and PostToolUse have not yet been observed; do not claim the 90% gate is active until this becomes `observed`.
+- `basic_instructions_configured` confirms the managed global instruction exists.
+- `last_final_check` and `final_check_count` show manual checks.
+- `last_state_update` and `state_update_count` show threshold saves.
+- `missing_events` reports absent current handlers.
+- `observed_events` records actual lifecycle delivery.
+- `automatic_monitoring: observed` requires a real `Stop` event; configuration alone is not proof.
 
-For basic-mode acceptance, activate in a conversation and complete two short requests. Each final answer should show a usage footer, and `final_check_count` should increase. For Hook acceptance, actual UserPromptSubmit/PostToolUse/Stop timestamps must advance. Synthetic tests validate code paths, not client delivery.
+For acceptance, verify that 49% does not request an update, 50% requests one update, repeated checks do not request another, 80% requests the second update, and a compaction starts a new cycle. Verify that even usage above 90% never denies a tool call. Defaults are state updates at 50% and 80%, with snapshots stale after 300 seconds.
 
-Defaults: handoff 0.85, hard stop 0.90, stale after 300 seconds. Set global flags **before** the subcommand, e.g. `--handoff 0.82 --stop 0.90 final-check --project ...`. For automatic thresholds, use the same flags before `hook` in every installed handler. Keep manual and automatic settings consistent.
-
-## Limits
-
-The JSONL format is version-dependent. Incremental observation retains peaks since activation; incomplete lines are retried. Current usage uses the latest supported snapshot; stale or unknown data is reported in final replies. Monitoring stores metadata, not transcripts or inferred task facts. OS file locks serialize monitoring state writes.
-
-Hosted tools may bypass PreToolUse or PostToolUse. Later checks can recover supported intermediate snapshots and compaction records from the transcript, but missing records cannot be reconstructed. A running tool cannot be interrupted or rolled back. Large output may cross multiple thresholds and compact before a hook boundary, so the 90% policy pauses at the next observed safe boundary rather than guaranteeing that automatic compaction never happens.
+The JSONL format is version-dependent. Incremental monitoring retries incomplete records. A large tool result may compact before the next observed boundary, and hosted tools may omit lifecycle events. These limits affect detection timing but never cause a percentage-based task stop.

@@ -1,15 +1,16 @@
 # Avoid Context Compaction
 
-Enable context monitoring once in a Codex conversation, see a usage status at the **end of every completed task**, choose whether to generate a handoff at **85%**, and safely pause at **90%** before starting another substantive step.
+Keep long Codex tasks moving while preserving recoverable task state.
 
-## Expected experience
+The skill is opt-in per conversation. Once enabled, it:
 
-1. Run the installer once, then restart Codex. The default basic installation adds a small managed block to the user's global `AGENTS.md`; it does not install Hooks or require Hook trust.
-2. Send `$avoid-context-compaction` in a conversation. The skill persists opt-in for that session and workspace. On the first activation, if lifecycle Hooks are absent and no preference was saved, it asks whether to configure Hook enhanced mode.
-3. Continue normally. Every final reply ends with a visible usage status. At or above 85%, it offers **yes, generate the handoff / no, not now**. At or above 90%, trusted lifecycle Hooks finish the already-started atomic step, prevent another substantive tool call, and pause for that choice.
-4. Choose yes: the model immediately prepares factual task state and updates the project's current `HANDOFF.md`, `RESUME.txt`, and `checkpoint.json`. The handoff and resume instructions follow the user's language (Chinese and English are supported). Choose no: no handoff is generated, and monitoring continues.
+- adds one context-usage sentence to the end of every final reply;
+- updates the conversation's task state once at 50% and once at 80% of each context cycle;
+- starts a new 50%/80% cycle after detected context compaction;
+- lets native compaction continue without a percentage-based hard stop; and
+- creates a detailed handoff and copyable resume prompt only when the user explicitly requests one.
 
-Monitoring persists after compaction. A peak remains pending even when compaction lowers current usage. If compaction was observed without a usable peak, report compaction without guessing a percentage. Merely invoking the skill never creates a handoff.
+Task-state updates and handoffs follow the user's language. Chinese and English document templates are included. A threshold update writes `TASK_STATE.md` and `state.json`; it never creates a handoff or asks the user to switch conversations.
 
 ## Install
 
@@ -19,51 +20,48 @@ Requires Python 3.10+:
 python scripts/install.py
 ```
 
-For a custom directory, add `--codex-home <absolute-directory>`. The installer preserves unrelated global `AGENTS.md` content and replaces only its own marked block. Re-running it is safe.
+Restart Codex, then invoke `$avoid-context-compaction` in the intended conversation. The default basic mode adds a managed block to the user's global `AGENTS.md` and requires no Hook trust. Re-running the installer is safe and preserves unrelated instructions.
 
-Restart Codex, then invoke the skill in the intended conversation. The basic mode needs no Hook review. To add lifecycle guards on a client that supports them, run `python scripts/install.py --with-hooks`, restart, and review/trust them. See [setup and verification](references/setup.md).
+Optional lifecycle support:
 
-If Hooks are not installed, the first activated conversation offers a labeled choice. Choosing default/basic mode is saved globally and suppresses Hook prompts in later conversations. Choosing enhanced mode returns the exact installation, restart, trust, and verification steps. Reset the saved choice with `python scripts/avoid_context_compaction.py hook-mode --choice ask`.
+```text
+python scripts/install.py --with-hooks
+```
+
+Restart Codex, review and trust the handlers in `/hooks`, then use `doctor` to verify real event delivery. Enhanced mode observes `SessionStart`, `UserPromptSubmit`, `PreCompact`, and `Stop`; it does not install `PreToolUse` or `PostToolUse` gates.
 
 ## Commands
 
-Run with `python scripts/avoid_context_compaction.py` from the skill directory, or use the installed script's absolute path:
-
 | Command | Purpose |
 | --- | --- |
-| `activate --project <absolute-project>` | Persist opt-in for this session; return usage and hook health. |
-| `hook-mode --choice basic\|enhanced\|ask` | Save the cross-conversation Hook preference or reset it. |
-| `final-check --project <absolute-project>` | Record the check and return the exact final-response status/footer. |
-| `decision --choice yes --project <absolute-project>` | Record actual consent for one handoff generation. |
-| `decision --choice no --project <absolute-project>` | Decline the offer and continue monitoring. |
-| `checkpoint --input <json-file> --project <absolute-project>` | Validate task facts and generate a handoff; enabled sessions require consent. |
-| `doctor --project <absolute-project>` | Inspect configured events and observed hook timestamps. |
+| `activate --project <path> --language <tag>` | Enable this conversation and select footer language. |
+| `final-check --project <path>` | Return usage, threshold-update status, and the exact footer. |
+| `state-update --input <json> --project <path>` | Save the due 50%/80% task state. |
+| `decision --choice yes --project <path>` | Record an explicit handoff request. |
+| `handoff --input <json> --project <path>` | Generate the detailed handoff and resume prompt. |
+| `doctor --project <path>` | Inspect basic instructions and observed Hook events. |
 | `status` | Read current usage without enabling monitoring. |
 
-Session identity comes from CODEX_THREAD_ID or CODEX_SESSION_ID. Global flags (`--session-id`, `--codex-home`, `--transcript`, `--handoff`, `--stop`) go **before** the command. Keep manual and automatic thresholds consistent.
+Global flags such as `--session-id`, `--codex-home`, `--transcript`, `--state-thresholds`, and `--stale-seconds` go before the subcommand.
 
 ## Saved data
 
 ```text
 <project>/.avoid-context-compaction/
   <session-id>/
-    monitor.json        activation, observed events, pending peaks, user choice
-    monitor.lock        OS lock for concurrent hooks
-  current.json          project-wide current handoff pointer
-  HANDOFF.md            current task handoff
-  RESUME.txt            exact recovery prompt
-  checkpoint.json       structured current task facts
+    monitor.json
+    monitor.lock
+    TASK_STATE.md
+    state.json
+    HANDOFF.md
+    RESUME.txt
+    handoff.json
+  current.json
 ```
 
-The model supplies facts using the [checkpoint schema](references/checkpoints.md); the script cannot independently summarize accomplishments. Each save atomically updates one project-wide handoff set, including across conversations. Existing per-session handoffs from older versions are retained and the newest valid target is reused on the first update. Legacy `.context-guard` handoffs remain readable. In a new conversation, use the exact resume instructions and verify actual workspace state before continuing.
+The session directory prevents unrelated tasks in the same project from overwriting each other. `current.json` records the newest explicitly generated handoff for compatibility and discovery; recovery prompts always identify the exact handoff path.
 
-The Hook preference is stored separately at `<CODEX_HOME>/avoid-context-compaction.json`, so selecting basic mode suppresses the setup question across projects and future conversations.
-
-## Limits and tests
-
-Usage is the conservative `(input + output) / context window` ratio from supported local JSONL snapshots, not cumulative usage, account quota, or exact live occupancy. Unknown/stale measurements are reported visibly. Hooks observe lifecycle boundaries, not every token; large results can cause compaction before work ends. A running tool cannot be interrupted or rolled back, and hosted tools may bypass lifecycle coverage, so the 90% policy stops at the next observed safe boundary. This skill does not disable compaction or repair network failures.
-
-Basic mode uses persistent agent instructions and reports every check visibly; it is still a prompt-level mechanism rather than an independent process. Optional trusted Hooks add a `PreToolUse` gate, a `PostToolUse` hard-stop signal, and a `Stop` footer correction; actual event delivery should be verified with `doctor`. Neither mode can rewrite displayed messages, guarantee model compliance, or create arbitrary choice buttons.
+Usage is estimated from supported local JSONL snapshots. Missing or stale measurements are shown as unavailable. Basic mode relies on agent instructions; trusted Hooks improve delivery checks but cannot edit displayed replies or guarantee that every hosted tool emits lifecycle events.
 
 ```text
 python -B -m unittest discover -s tests -v
