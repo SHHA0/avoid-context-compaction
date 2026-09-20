@@ -57,6 +57,12 @@ class MonitorTests(unittest.TestCase):
         with self.transcript.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(row) + "\n")
 
+    def append_user_message(self, message="continue"):
+        row = {"type": "event_msg", "timestamp": core.utcnow().isoformat(),
+               "payload": {"type": "user_message", "message": message}}
+        with self.transcript.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row) + "\n")
+
     def state(self):
         return monitor.load(monitor.state_path(self.project, "session-a"))
 
@@ -76,11 +82,18 @@ class MonitorTests(unittest.TestCase):
                    "state-update", "--project", str(self.project), "--input", str(source)]
         return subprocess.run(command, capture_output=True, text=True)
 
-    def run_handoff(self):
-        source = self.root / "handoff-input.json"
-        source.write_text(json.dumps(self.task_data(), ensure_ascii=False), encoding="utf-8")
+    def run_state_refresh(self, base_saved_at=None):
+        source = self.root / "refresh-input.json"
+        data = self.task_data()
+        data["base_state_saved_at"] = base_saved_at
+        source.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
         command = [sys.executable, "-B", str(Path(core.__file__)), *self.global_args,
-                   "handoff", "--project", str(self.project), "--input", str(source)]
+                   "state-refresh", "--project", str(self.project), "--input", str(source)]
+        return subprocess.run(command, capture_output=True, text=True)
+
+    def run_handoff(self):
+        command = [sys.executable, "-B", str(Path(core.__file__)), *self.global_args,
+                   "handoff", "--project", str(self.project)]
         return subprocess.run(command, capture_output=True, text=True)
 
     def test_uninvoked_session_is_silent(self):
@@ -121,6 +134,23 @@ class MonitorTests(unittest.TestCase):
         result = self.command("final-check")
         self.assertEqual(result["state_update_level"], .8)
         self.assertEqual(self.state()["levels_reached"], [.5, .8])
+        self.assertEqual(self.run_state_update().returncode, 0)
+        self.assertFalse(self.command("final-check")["state_update_due"])
+        self.append(compact=True)
+        self.append_user_message("continue after compaction")
+        self.append(.20)
+        self.assertFalse(self.command("final-check")["state_update_due"])
+
+    def test_state_rolls_forward_each_new_user_turn_after_80(self):
+        self.append(.81)
+        self.command("activate")
+        self.assertEqual(self.run_state_update().returncode, 0)
+        self.assertFalse(self.command("final-check")["state_update_due"])
+        self.append_user_message("apply one more correction")
+        self.append(.82)
+        due = self.command("final-check")
+        self.assertTrue(due["state_update_due"])
+        self.assertEqual(due["state_update_level"], .8)
         self.assertEqual(self.run_state_update().returncode, 0)
         self.assertFalse(self.command("final-check")["state_update_due"])
 
@@ -184,11 +214,30 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(denied.returncode, 2)
         self.assertFalse(list(self.project.rglob("HANDOFF.md")))
         self.command("decision", "--choice", "yes")
+        stale = self.run_handoff()
+        self.assertEqual(stale.returncode, 2)
+        self.assertIn("state-refresh", stale.stderr)
+        refreshed = self.run_state_refresh(None)
+        self.assertEqual(refreshed.returncode, 0, refreshed.stderr)
         accepted = self.run_handoff()
         self.assertEqual(accepted.returncode, 0, accepted.stderr)
         self.assertTrue(list(self.project.rglob("HANDOFF.md")))
         self.assertFalse(self.state().get("approved"))
         self.assertEqual(self.run_handoff().returncode, 2)
+
+    def test_handoff_refresh_must_cite_latest_state_file(self):
+        self.append(.51)
+        self.command("activate")
+        self.assertEqual(self.run_state_update().returncode, 0)
+        saved = json.loads((self.project / core.DATA_DIR_NAME / "session-a" / "state.json").read_text(encoding="utf-8"))
+        self.command("decision", "--choice", "yes")
+        rejected = self.run_state_refresh("stale-timestamp")
+        self.assertEqual(rejected.returncode, 2)
+        self.assertIn("reread the task state", rejected.stderr)
+        accepted = self.run_state_refresh(saved["meta"]["saved_at"])
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        handoff = self.run_handoff()
+        self.assertEqual(handoff.returncode, 0, handoff.stderr)
 
     def test_partial_record_is_retried(self):
         self.append(.30)

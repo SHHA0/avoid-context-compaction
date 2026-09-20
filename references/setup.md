@@ -6,13 +6,10 @@ Basic mode asks the main agent to run `final-check` before every final reply. A 
 
 ## Optional lifecycle Hooks
 
-Install with `python <skill>/scripts/install.py --with-hooks`, restart, then review and explicitly trust the handlers in `/hooks`. The installer removes obsolete managed `PreToolUse` and `PostToolUse` handlers from older releases.
+Install with `python <skill>/scripts/install.py --with-hooks`, restart, then review and explicitly trust the `Stop` handler in `/hooks`. The installer removes all other managed lifecycle handlers from older releases.
 
 | Event | Enabled-session behavior |
 | --- | --- |
-| UserPromptSubmit | Reinject the monitoring workflow and any due state-update notice. |
-| PreCompact | Start a new threshold cycle without blocking work. |
-| SessionStart | Restore instructions and identify saved task state when present. |
 | Stop | Request one short continuation when a state update or footer was omitted. |
 
 Stop uses `decision: "block"` to request a continuation, not to cancel the task. A turn ID and `stop_hook_active` prevent correction loops. Hooks never deny tool use because of context percentage.
@@ -24,10 +21,10 @@ Run `python <skill>/scripts/avoid_context_compaction.py doctor --project <absolu
 - `basic_instructions_configured` confirms the managed global instruction exists.
 - `last_final_check` and `final_check_count` show manual checks.
 - `last_state_update` and `state_update_count` show threshold saves.
-- `missing_events` reports absent current handlers.
+- `missing_events` reports whether the Stop handler is absent.
 - `observed_events` records actual lifecycle delivery.
 - `automatic_monitoring: observed` requires a real `Stop` event; configuration alone is not proof.
 
-For acceptance, verify that 49% does not request an update, 50% requests one update, repeated checks do not request another, 80% requests the second update, and a compaction starts a new cycle. Verify that even usage above 90% never denies a tool call. Defaults are state updates at 50% and 80%, with snapshots stale after 300 seconds.
+For acceptance, verify that 49% does not request an update, 50% requests one update, repeated checks do not request another, and 80% requests the second update. After that update, a new user turn must request one rolling refresh while a repeated check in the same turn must not. Compaction starts a new cycle. Verify that even usage above 90% never denies a tool call. Defaults are state updates at 50% and 80%, with snapshots stale after 300 seconds.
 
 The JSONL format is version-dependent. Incremental monitoring retries incomplete records. A large tool result may compact before the next observed boundary, and hosted tools may omit lifecycle events. These limits affect detection timing but never cause a percentage-based task stop.

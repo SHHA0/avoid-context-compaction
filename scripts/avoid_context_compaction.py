@@ -17,7 +17,6 @@ from typing import Any
 DEFAULT_STATE_THRESHOLDS = (0.50, 0.80)
 DEFAULT_STALE_SECONDS = 300
 DATA_DIR_NAME = ".avoid-context-compaction"
-LEGACY_DATA_DIR_NAME = ".context-guard"
 REQUIRED = (
     "task", "project_goal", "expected_outcome", "requirements", "corrections", "decisions",
     "completed", "results", "verification", "remaining", "next_steps", "cautions", "workspace", "status",
@@ -287,25 +286,79 @@ def state_update(args: argparse.Namespace) -> int:
         atomic_text(markdown_path, render_task_document(data, meta, handoff=False))
         state.update(pending_state_level=None, last_state_update=meta["saved_at"],
                      state_update_count=state.get("state_update_count", 0) + 1,
-                     task_state=str(markdown_path), task_state_json=str(json_path))
+                     task_state=str(markdown_path), task_state_json=str(json_path),
+                     wait_for_user_message_after_update=bool(state.get("rolling_after_upper_threshold")))
+        state.pop("pending_state_reason", None)
         atomic_json(monitor_path, state)
     print(json.dumps({"task_state": str(markdown_path), "state_json": str(json_path), "threshold": meta["threshold"]}, ensure_ascii=False, indent=2))
     return 0
 
 
-def handoff(args: argparse.Namespace) -> int:
+def state_refresh(args: argparse.Namespace) -> int:
+    """Refresh current task state immediately before an explicitly requested handoff."""
     import monitor
-    sid = session_id(args.session_id) or "manual"
+    sid = session_id(args.session_id)
+    if not sid:
+        raise ValueError("a session ID is required")
     project = Path(args.project).resolve()
     monitor_path = monitor.state_path(project, sid)
     with monitor.locked(monitor_path):
         state = monitor.load(monitor_path)
-        if state.get("enabled") and not state.get("approved"):
-            raise ValueError("explicit user request required: run decision --choice yes before handoff")
-        data = validate_task_state(json.loads(Path(args.input).resolve().read_text(encoding="utf-8-sig")))
-        usage = usage_status(args, sid_override=sid)
-        meta = {"saved_at": utcnow().isoformat(), "session_id": safe_id(sid), "project": str(project), "usage": usage}
+        if not state.get("enabled") or not state.get("approved"):
+            raise ValueError("explicit handoff request required: run decision --choice yes before state-refresh")
         root = session_root(project, sid)
+        json_path = root / "state.json"
+        previous = json.loads(json_path.read_text(encoding="utf-8-sig")) if json_path.exists() else None
+        previous_saved_at = previous.get("meta", {}).get("saved_at") if isinstance(previous, dict) else None
+        supplied = json.loads(Path(args.input).resolve().read_text(encoding="utf-8-sig"))
+        if not isinstance(supplied, dict):
+            raise ValueError("task state must be a JSON object")
+        base_saved_at = supplied.pop("base_state_saved_at", None)
+        if base_saved_at != previous_saved_at:
+            raise ValueError("state-refresh must cite the latest state.json meta.saved_at; reread the task state and retry")
+        data = validate_task_state(supplied)
+        usage = usage_status(args, sid_override=sid)
+        meta = {"saved_at": utcnow().isoformat(), "session_id": safe_id(sid), "project": str(project),
+                "usage": usage, "threshold": None, "cycle": state.get("cycle", 0), "purpose": "handoff_refresh",
+                "base_state_saved_at": previous_saved_at}
+        markdown_path = root / "TASK_STATE.md"
+        atomic_json(json_path, {"meta": meta, "state": data})
+        atomic_text(markdown_path, render_task_document(data, meta, handoff=False))
+        state.update(pending_state_level=None, last_state_update=meta["saved_at"],
+                     state_update_count=state.get("state_update_count", 0) + 1,
+                     task_state=str(markdown_path), task_state_json=str(json_path),
+                     handoff_ready_state_saved_at=meta["saved_at"],
+                     wait_for_user_message_after_update=bool(state.get("rolling_after_upper_threshold")))
+        state.pop("pending_state_reason", None)
+        atomic_json(monitor_path, state)
+    print(json.dumps({"task_state": str(markdown_path), "state_json": str(json_path),
+                      "handoff_ready": True, "saved_at": meta["saved_at"]}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def handoff(args: argparse.Namespace) -> int:
+    import monitor
+    sid = session_id(args.session_id)
+    if not sid:
+        raise ValueError("a session ID is required")
+    project = Path(args.project).resolve()
+    monitor_path = monitor.state_path(project, sid)
+    with monitor.locked(monitor_path):
+        state = monitor.load(monitor_path)
+        if not state.get("enabled") or not state.get("approved"):
+            raise ValueError("explicit user request required: run decision --choice yes before handoff")
+        root = session_root(project, sid)
+        state_json_path = root / "state.json"
+        if not state_json_path.exists():
+            raise ValueError("fresh task state required: run state-refresh before handoff")
+        saved_state = json.loads(state_json_path.read_text(encoding="utf-8-sig"))
+        saved_at = saved_state.get("meta", {}).get("saved_at") if isinstance(saved_state, dict) else None
+        if not saved_at or saved_at != state.get("handoff_ready_state_saved_at"):
+            raise ValueError("fresh task state required: reread state.json and run state-refresh before handoff")
+        data = validate_task_state(saved_state.get("state"))
+        usage = usage_status(args, sid_override=sid)
+        meta = {"saved_at": utcnow().isoformat(), "session_id": safe_id(sid), "project": str(project),
+                "usage": usage, "source_state_saved_at": saved_at}
         handoff_path, resume_path, json_path = root / "HANDOFF.md", root / "RESUME.txt", root / "handoff.json"
         if task_language(data) == "zh":
             resume = (
@@ -326,27 +379,10 @@ def handoff(args: argparse.Namespace) -> int:
         atomic_json(project / DATA_DIR_NAME / "current.json", {
             "handoff": str(handoff_path), "resume": str(resume_path), "structured": str(json_path), "saved_at": meta["saved_at"]
         })
-        if state.get("enabled"):
-            state["approved"] = False
-            atomic_json(monitor_path, state)
+        state.update(approved=False, handoff_ready_state_saved_at=None)
+        atomic_json(monitor_path, state)
     print(json.dumps({"handoff": str(handoff_path), "resume": str(resume_path), "structured": str(json_path)}, ensure_ascii=False, indent=2))
     return 0
-
-
-def load_task_state(project: Path, sid: str) -> tuple[Path | None, str | None]:
-    path = session_root(project, sid) / "TASK_STATE.md"
-    try:
-        return (path, path.read_text(encoding="utf-8")) if path.exists() else (None, None)
-    except OSError:
-        return path, None
-
-
-def load_current_handoff(project: Path, sid: str) -> tuple[Path | None, str | None]:
-    path = session_root(project, sid) / "HANDOFF.md"
-    try:
-        return (path, path.read_text(encoding="utf-8")) if path.exists() else (None, None)
-    except OSError:
-        return path, None
 
 
 def hook(args: argparse.Namespace) -> int:
@@ -364,10 +400,12 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     status_parser = sub.add_parser("status")
     status_parser.add_argument("--json", action="store_true")
-    for name in ("state-update", "handoff", "checkpoint"):
+    for name in ("state-update", "state-refresh"):
         artifact = sub.add_parser(name)
         artifact.add_argument("--input", required=True)
         artifact.add_argument("--project", required=True)
+    handoff_parser = sub.add_parser("handoff")
+    handoff_parser.add_argument("--project", required=True)
     sub.add_parser("hook")
     hook_mode_parser = sub.add_parser("hook-mode")
     hook_mode_parser.add_argument("--choice", choices=("basic", "enhanced", "ask"), required=True)
@@ -391,7 +429,9 @@ def main() -> int:
             return 0 if result.get("level") != "unknown" else 1
         if args.command == "state-update":
             return state_update(args)
-        if args.command in {"handoff", "checkpoint"}:
+        if args.command == "state-refresh":
+            return state_refresh(args)
+        if args.command == "handoff":
             return handoff(args)
         if args.command == "hook":
             return hook(args)

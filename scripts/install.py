@@ -13,8 +13,8 @@ import tempfile
 from pathlib import Path
 
 
-EVENTS = ("SessionStart", "UserPromptSubmit", "PreCompact", "Stop")
-MANAGED_EVENTS = EVENTS + ("PreToolUse", "PostToolUse")
+EVENTS = ("Stop",)
+MANAGED_EVENTS = EVENTS + ("SessionStart", "UserPromptSubmit", "PreCompact", "PreToolUse", "PostToolUse")
 INSTALL_IGNORES = (".git", ".avoid-context-compaction", ".context-guard", "__pycache__", "*.pyc")
 BASIC_BEGIN = "<!-- avoid-context-compaction:basic-monitor:begin -->"
 BASIC_END = "<!-- avoid-context-compaction:basic-monitor:end -->"

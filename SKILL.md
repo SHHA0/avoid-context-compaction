@@ -17,7 +17,7 @@ python <skill>/scripts/avoid_context_compaction.py activate --project <absolute-
 
 Use the current `CODEX_THREAD_ID` or `CODEX_SESSION_ID`. Activation is scoped to this conversation and project. Reading or installing the skill does not activate it.
 
-If `basic_instructions_configured` is false, explain that persistent basic monitoring requires `python scripts/install.py` and a Codex restart. If `hook_setup.offer` is true, ask the labeled Hook choice once: **Configure Hook enhanced mode? Choose: yes, show setup steps / no, use basic mode.** Basic mode already provides final checks; trusted Hooks add lifecycle reinjection and footer correction. Follow the returned setup steps only when the user chooses enhanced mode.
+If `basic_instructions_configured` is false, explain that persistent basic monitoring requires `python scripts/install.py` and a Codex restart. If `hook_setup.offer` is true, ask the labeled Hook choice once: **Configure the Stop Hook fallback? Choose: yes, show setup steps / no, use basic mode.** Basic mode already provides final checks; the trusted `Stop` Hook only catches an omitted state update or footer. Follow the returned setup steps only when the user chooses it.
 
 ## Before every final reply
 
@@ -35,7 +35,7 @@ python <skill>/scripts/avoid_context_compaction.py state-update --input <json-fi
 
 Then rerun `final-check`. Append only its nonempty `footer` verbatim as the final sentence of the reply. Do not mention threshold crossings, ask for a handoff, or pause the task because of usage.
 
-The 50% and 80% thresholds apply once per context cycle. When usage jumps across both before a check, one 80% update satisfies both. After a detected compaction, a new cycle begins and the thresholds can trigger again. State updates replace the current conversation's `TASK_STATE.md` and `state.json`; they do not create handoff files.
+The 50% and 80% thresholds apply once per context cycle. When usage jumps across both before a check, one 80% update satisfies both. After the 80% update, each later user turn triggers one rolling state refresh at that turn's end, keeping the pre-compaction record current. After a detected compaction, a new cycle begins and the thresholds can trigger again. State updates replace the current conversation's `TASK_STATE.md` and `state.json`; they do not create handoff files.
 
 ## Generate a handoff only on request
 
@@ -45,13 +45,14 @@ An explicit request from the user to generate a handoff counts as consent. Run:
 python <skill>/scripts/avoid_context_compaction.py decision --choice yes --project <absolute-session-project>
 ```
 
-Start from the latest task state when available, then collect the detailed facts defined in [the task-state schema](references/checkpoints.md), including requirements, corrections, decisions, results, verification, remaining work, and workspace state. Then run:
+Next, locate the current conversation's `TASK_STATE.md` and `state.json`. Read both when they exist. Copy the exact `meta.saved_at` value from `state.json` into `base_state_saved_at`; use `null` only when no state file exists. Reconcile that saved state with everything that happened afterward, the current conversation, actual files, verification, running operations, and workspace state. Write a complete current snapshot using [the task-state schema](references/checkpoints.md), then run:
 
 ```text
-python <skill>/scripts/avoid_context_compaction.py handoff --input <json-file> --project <absolute-session-project>
+python <skill>/scripts/avoid_context_compaction.py state-refresh --input <json-file> --project <absolute-session-project>
+python <skill>/scripts/avoid_context_compaction.py handoff --project <absolute-session-project>
 ```
 
-Read the generated `HANDOFF.md` and `RESUME.txt`, then provide clickable absolute links and the exact copyable resume prompt. Match the user's language. A handoff request authorizes one successful generation; a failed attempt may be retried. Never infer consent from a threshold, compaction, silence, or an unrelated request.
+`state-refresh` rejects a stale or missing base timestamp, and `handoff` reads only the freshly written `state.json`; it does not accept a separate facts input. This captures work performed after the last 80% update. Read the generated `HANDOFF.md` and `RESUME.txt`, then provide clickable absolute links and the exact copyable resume prompt. Match the user's language. A handoff request authorizes one successful generation; a failed attempt may be retried. Never infer consent from a threshold, compaction, silence, or an unrelated request.
 
 ## Recovery and limits
 

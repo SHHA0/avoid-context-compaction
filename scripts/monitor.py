@@ -11,7 +11,7 @@ from pathlib import Path
 import avoid_context_compaction as core
 
 
-EVENTS = ("SessionStart", "UserPromptSubmit", "PreCompact", "Stop")
+EVENTS = ("Stop",)
 BASIC_BEGIN = "<!-- avoid-context-compaction:basic-monitor:begin -->"
 PREFERENCES_FILE = "avoid-context-compaction.json"
 
@@ -96,7 +96,7 @@ def hook_install_steps(args):
         f'Run: "{executable}" "{installer}" --codex-home "{home}" --with-hooks',
         "Restart Codex so the updated lifecycle Hook definitions are loaded.",
         "Open /hooks, review the avoid-context-compaction handlers, and explicitly trust them.",
-        "Invoke $avoid-context-compaction, then run doctor and verify real Stop and PreCompact events.",
+        "Invoke $avoid-context-compaction, then run doctor and verify a real Stop event.",
     ]
 
 
@@ -106,15 +106,15 @@ def hook_setup(args, first_activation=False):
     preference = load_preferences(args).get("hook_mode")
     if complete:
         return {"mode": "enhanced", "configured": True, "offer": False, "action_required": False,
-                "message": "Hook enhanced mode is configured; use doctor to verify actual event delivery and trust."}
+                "message": "The Stop Hook fallback is configured; use doctor to verify actual event delivery and trust."}
     if preference == "basic":
         return {"mode": "basic", "configured": False, "offer": False, "action_required": False,
-                "message": "Basic mode was selected globally; do not prompt about Hook enhanced mode again."}
+                "message": "Basic mode was selected globally; do not prompt about the Stop Hook fallback again."}
     if preference == "enhanced":
         return {"mode": "enhanced", "configured": False, "offer": False, "action_required": True,
-                "message": "Hook enhanced mode was requested but is not fully configured.", "steps": hook_install_steps(args)}
+                "message": "The Stop Hook fallback was requested but is not fully configured.", "steps": hook_install_steps(args)}
     return {"mode": "unselected", "configured": False, "offer": bool(first_activation), "action_required": False,
-            "message": "Hook enhanced mode is not configured. Ask once: Configure Hook enhanced mode? Choose: yes, show setup steps / no, use basic mode."}
+            "message": "The Stop Hook fallback is not configured. Ask once: Configure the Stop Hook fallback? Choose: yes, show setup steps / no, use basic mode."}
 
 
 def hook_mode(args):
@@ -129,9 +129,9 @@ def hook_mode(args):
         core.atomic_json(path, preferences)
     result = {"choice": args.choice, "preferences": str(path), **hook_setup(args)}
     if args.choice == "basic":
-        result["message"] = "Basic mode selected globally. Future conversations must not prompt about Hook mode."
+        result["message"] = "Basic mode selected globally. Future conversations must not prompt about the Stop Hook fallback."
     elif args.choice == "enhanced":
-        result["message"] = "Hook enhanced mode selected globally. Complete the returned steps; trust is never written automatically."
+        result["message"] = "Stop Hook fallback selected globally. Complete the returned steps; trust is never written automatically."
         result["steps"] = hook_install_steps(args)
     else:
         result["message"] = "Hook mode preference cleared. The next newly activated conversation will offer the choice again if Hooks are absent."
@@ -142,6 +142,8 @@ def hook_mode(args):
 def advance_cycle(state):
     state["cycle"] = state.get("cycle", 0) + 1
     state["levels_reached"] = []
+    state["rolling_after_upper_threshold"] = False
+    state["wait_for_user_message_after_update"] = False
 
 
 def remember_threshold(state, args, ratio):
@@ -155,6 +157,8 @@ def remember_threshold(state, args, ratio):
     state["levels_reached"] = sorted(reached)
     state["pending_state_level"] = max(state.get("pending_state_level") or 0, max(crossed))
     state["pending_state_cycle"] = state.get("cycle", 0)
+    if max(crossed) >= max(args.state_thresholds):
+        state["rolling_after_upper_threshold"] = True
 
 
 def observe(state, args, transcript=None):
@@ -192,6 +196,14 @@ def observe(state, args, transcript=None):
                         advance_cycle(state)
                     continue
                 payload = record.get("payload")
+                if record.get("type") == "event_msg" and isinstance(payload, dict) and payload.get("type") == "user_message":
+                    if state.get("rolling_after_upper_threshold") and state.get("wait_for_user_message_after_update"):
+                        upper = max(args.state_thresholds)
+                        state["pending_state_level"] = max(state.get("pending_state_level") or 0, upper)
+                        state["pending_state_cycle"] = state.get("cycle", 0)
+                        state["pending_state_reason"] = "new user turn after upper threshold"
+                        state["wait_for_user_message_after_update"] = False
+                    continue
                 if record.get("type") != "event_msg" or not isinstance(payload, dict) or payload.get("type") != "token_count":
                     continue
                 info = payload.get("info")
@@ -218,16 +230,6 @@ def footer(state):
     return f"当前上下文用量：约 {ratio:.1%}。" if is_chinese(state) else f"Context usage: approximately {ratio:.1%}."
 
 
-def instructions(state):
-    script = Path(core.__file__).resolve()
-    return (
-        "avoid-context-compaction is enabled. Continue the user's task without stopping for context percentages. Before every final reply run "
-        f'python "{script}" final-check --project "{state["project"]}". If state_update_due is true, read the task-state schema, gather factual '
-        "state in the user's language, run state-update, and rerun final-check. Append only the returned footer verbatim at the very end. "
-        "Generate HANDOFF.md and RESUME.txt only when the user explicitly requests a handoff; record that request with decision --choice yes first."
-    )
-
-
 def delivered(state, message):
     ending = str(message or "").rstrip()
     expected = footer(state)
@@ -250,7 +252,7 @@ def health(args, state):
         "last_state_update": state.get("last_state_update"), "state_update_count": state.get("state_update_count", 0),
         "configured_events": configured, "missing_events": [event for event in EVENTS if event not in configured],
         "observed_events": observed, "automatic_monitoring": "observed" if observed.get("Stop") else "unverified",
-        "note": "Configuration alone does not prove Hook trust or execution. Verify real Stop and PreCompact events after restart.",
+        "note": "Configuration alone does not prove Hook trust or execution. Verify a real Stop event after restart.",
     }
 
 
@@ -275,7 +277,7 @@ def command(args):
         if args.command == "activate" and getattr(args, "language", None):
             state["language"] = args.language
         if args.command == "decision":
-            state["approved"] = args.choice == "yes"
+            state.update(approved=args.choice == "yes", handoff_ready_state_saved_at=None)
             output = {"choice": args.choice, "generate_now": args.choice == "yes"}
         else:
             observe(state, args)
@@ -313,9 +315,6 @@ def hook(args):
             return 0
         state.setdefault("observed_events", {})[event] = core.utcnow().isoformat()
         observe(state, args, incoming.get("transcript_path"))
-        if event == "PreCompact":
-            advance_cycle(state)
-            state["skip_next_compaction_event"] = True
         output = None
         if event == "Stop":
             due = state.get("pending_state_level") is not None
@@ -332,14 +331,6 @@ def hook(args):
                     output = {"decision": "block", "reason": action + "Append only its footer at the end of the final reply, then stop."}
                 else:
                     output = {"systemMessage": "The final reply did not complete the required state update/footer check; stopping to avoid a loop."}
-        elif event in {"SessionStart", "UserPromptSubmit"}:
-            context = instructions(state)
-            state_path_value, saved_state = core.load_task_state(project, sid)
-            if saved_state:
-                context += f" The current task state is {state_path_value}; read and verify it when recovery or compaction makes that useful."
-            if state.get("pending_state_level") is not None:
-                context += f" A task-state update is due for the {state['pending_state_level']:.0%} threshold."
-            output = {"hookSpecificOutput": {"hookEventName": event, "additionalContext": context}}
         core.atomic_json(path, state)
     if output:
         print(json.dumps(output, ensure_ascii=False))

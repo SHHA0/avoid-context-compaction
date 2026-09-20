@@ -74,11 +74,22 @@ class ContextStateTests(unittest.TestCase):
             root = Path(temp)
             project = root / "project"
             project.mkdir()
+            transcript = root / "session.jsonl"
+            self.write_jsonl(transcript, [event(core.utcnow().isoformat(), 200, 0)])
             source = root / "input.json"
-            source.write_text(json.dumps(self.task_data("zh-CN"), ensure_ascii=False), encoding="utf-8")
+            data = self.task_data("zh-CN")
+            data["base_state_saved_at"] = None
+            source.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
             env = dict(os.environ, CODEX_THREAD_ID="session-zh")
-            command = [sys.executable, str(SCRIPT), "handoff", "--input", str(source), "--project", str(project)]
-            result = json.loads(subprocess.run(command, env=env, check=True, capture_output=True, text=True).stdout)
+            global_args = ["--transcript", str(transcript)]
+            subprocess.run([sys.executable, str(SCRIPT), *global_args, "activate", "--project", str(project), "--language", "zh-CN"],
+                           env=env, check=True, capture_output=True, encoding="utf-8")
+            subprocess.run([sys.executable, str(SCRIPT), *global_args, "decision", "--choice", "yes", "--project", str(project)],
+                           env=env, check=True, capture_output=True, encoding="utf-8")
+            subprocess.run([sys.executable, str(SCRIPT), *global_args, "state-refresh", "--input", str(source), "--project", str(project)],
+                           env=env, check=True, capture_output=True, encoding="utf-8")
+            command = [sys.executable, str(SCRIPT), *global_args, "handoff", "--project", str(project)]
+            result = json.loads(subprocess.run(command, env=env, check=True, capture_output=True, encoding="utf-8").stdout)
             self.assertIn("session-zh", result["handoff"])
             self.assertIn("任务交接", Path(result["handoff"]).read_text(encoding="utf-8"))
             self.assertIn("继续项目", Path(result["resume"]).read_text(encoding="utf-8"))
@@ -91,7 +102,10 @@ class ContextStateTests(unittest.TestCase):
             hooks = {"description": "existing", "hooks": {"PreToolUse": [{"hooks": [
                 {"type": "command", "command": "python avoid_context_compaction.py hook"},
                 {"type": "command", "command": "existing-tool"}
-            ]}], "PostToolUse": [{"hooks": [{"type": "command", "command": "python context_guard.py hook"}]}]}}
+            ]}], "PostToolUse": [{"hooks": [{"type": "command", "command": "python context_guard.py hook"}]}],
+                "SessionStart": [{"hooks": [{"type": "command", "command": "python avoid_context_compaction.py hook"}]}],
+                "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "python avoid_context_compaction.py hook"}]}],
+                "PreCompact": [{"hooks": [{"type": "command", "command": "python avoid_context_compaction.py hook"}]}]}}
             (home / "hooks.json").write_text(json.dumps(hooks), encoding="utf-8")
             command = [sys.executable, str(INSTALLER), "--codex-home", str(home), "--with-hooks"]
             subprocess.run(command, check=True, capture_output=True, text=True)
@@ -99,8 +113,9 @@ class ContextStateTests(unittest.TestCase):
             self.assertNotIn("PostToolUse", merged["hooks"])
             self.assertTrue(any("existing-tool" in str(group) for group in merged["hooks"]["PreToolUse"]))
             self.assertFalse(any("avoid_context_compaction.py" in str(group) for group in merged["hooks"]["PreToolUse"]))
-            for event_name in ("SessionStart", "UserPromptSubmit", "PreCompact", "Stop"):
-                self.assertIn(event_name, merged["hooks"])
+            for event_name in ("SessionStart", "UserPromptSubmit", "PreCompact", "PostToolUse"):
+                self.assertNotIn(event_name, merged["hooks"])
+            self.assertIn("Stop", merged["hooks"])
             agents = (home / "AGENTS.md").read_text(encoding="utf-8")
             self.assertIn("state_update_due", agents)
             self.assertNotIn("hard-stop", agents)
