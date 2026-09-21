@@ -1,4 +1,4 @@
-# Avoid Context Compaction
+# Context Continuity
 
 Keep long Codex tasks moving while preserving recoverable task state.
 
@@ -21,7 +21,7 @@ Requires Python 3.10+:
 python scripts/install.py
 ```
 
-Restart Codex, then invoke `$avoid-context-compaction` in the intended conversation. The default basic mode adds a managed block to the user's global `AGENTS.md` and requires no Hook trust. Re-running the installer is safe and preserves unrelated instructions.
+Restart Codex, then invoke `$context-continuity` in the intended conversation. The default basic mode adds a managed block to the user's global `AGENTS.md` and requires no Hook trust. Re-running the installer is safe and preserves unrelated instructions.
 
 Optional Stop Hook fallback:
 
@@ -49,7 +49,7 @@ Global flags such as `--session-id`, `--codex-home`, `--transcript`, `--state-th
 ## Saved data
 
 ```text
-<project>/.avoid-context-compaction/
+<project>/.context-continuity/
   <session-id>/
     monitor.json
     monitor.lock
@@ -62,6 +62,8 @@ Global flags such as `--session-id`, `--codex-home`, `--transcript`, `--state-th
 ```
 
 The session directory prevents unrelated tasks in the same project from overwriting each other. `current.json` records the newest explicitly generated handoff for compatibility and discovery; recovery prompts always identify the exact handoff path.
+
+Existing `.avoid-context-compaction` and `.context-guard` session state remains readable. New conversations write to `.context-continuity`.
 
 Usage is estimated from supported local JSONL snapshots. Missing or stale measurements are shown as unavailable. Basic mode relies on agent instructions; trusted Hooks improve delivery checks but cannot edit displayed replies or guarantee that every hosted tool emits lifecycle events.
 

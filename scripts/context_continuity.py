@@ -16,7 +16,8 @@ from typing import Any
 
 DEFAULT_STATE_THRESHOLDS = (0.50, 0.80)
 DEFAULT_STALE_SECONDS = 300
-DATA_DIR_NAME = ".avoid-context-compaction"
+DATA_DIR_NAME = ".context-continuity"
+LEGACY_DATA_DIR_NAMES = (".avoid-context-compaction", ".context-guard")
 REQUIRED = (
     "task", "project_goal", "expected_outcome", "requirements", "corrections", "decisions",
     "completed", "results", "verification", "remaining", "next_steps", "cautions", "workspace", "status",
@@ -260,7 +261,14 @@ def render_task_document(data: dict[str, Any], meta: dict[str, Any], handoff: bo
 
 
 def session_root(project: Path, sid: str) -> Path:
-    return project / DATA_DIR_NAME / safe_id(sid)
+    preferred = project / DATA_DIR_NAME / safe_id(sid)
+    if preferred.exists():
+        return preferred
+    for directory in LEGACY_DATA_DIR_NAMES:
+        legacy = project / directory / safe_id(sid)
+        if legacy.exists():
+            return legacy
+    return preferred
 
 
 def state_update(args: argparse.Namespace) -> int:
@@ -443,7 +451,7 @@ def main() -> int:
         if args.command == "hook":
             print(json.dumps({"systemMessage": f"Context monitoring failed; automatic checks remain unverified: {exc}"}, ensure_ascii=False))
             return 0
-        print(f"avoid-context-compaction: {exc}", file=sys.stderr)
+        print(f"context-continuity: {exc}", file=sys.stderr)
         return 2
 
 

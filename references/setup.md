@@ -1,6 +1,6 @@
 # Setup and verification
 
-Run `python <skill>/scripts/install.py` to copy the skill into `CODEX_HOME/skills/avoid-context-compaction` and update its marked block in `CODEX_HOME/AGENTS.md`. Restart Codex, then invoke the skill in the intended conversation. Installation alone does not activate monitoring.
+Run `python <skill>/scripts/install.py` to copy the skill into `CODEX_HOME/skills/context-continuity` and update its marked block in `CODEX_HOME/AGENTS.md`. Restart Codex, then invoke the skill in the intended conversation. Installation alone does not activate monitoring.
 
 Basic mode asks the main agent to run `final-check` before every final reply. A due 50% or 80% update is written before the reply, then the final check is repeated. The visible reply ends with only the current usage sentence.
 
@@ -16,7 +16,7 @@ Stop uses `decision: "block"` to request a continuation, not to cancel the task.
 
 ## Diagnose
 
-Run `python <skill>/scripts/avoid_context_compaction.py doctor --project <absolute-project>`.
+Run `python <skill>/scripts/context_continuity.py doctor --project <absolute-project>`.
 
 - `basic_instructions_configured` confirms the managed global instruction exists.
 - `last_final_check` and `final_check_count` show manual checks.

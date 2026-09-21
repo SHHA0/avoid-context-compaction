@@ -8,9 +8,9 @@ import tempfile
 import unittest
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "avoid_context_compaction.py"
+SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "context_continuity.py"
 INSTALLER = Path(__file__).resolve().parents[1] / "scripts" / "install.py"
-SPEC = importlib.util.spec_from_file_location("avoid_context_compaction", SCRIPT)
+SPEC = importlib.util.spec_from_file_location("context_continuity", SCRIPT)
 core = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader
 SPEC.loader.exec_module(core)
@@ -107,6 +107,11 @@ class ContextStateTests(unittest.TestCase):
                 "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "python avoid_context_compaction.py hook"}]}],
                 "PreCompact": [{"hooks": [{"type": "command", "command": "python avoid_context_compaction.py hook"}]}]}}
             (home / "hooks.json").write_text(json.dumps(hooks), encoding="utf-8")
+            (home / "AGENTS.md").write_text(
+                "# Existing\n\n<!-- avoid-context-compaction:basic-monitor:begin -->\nold block\n<!-- avoid-context-compaction:basic-monitor:end -->\n",
+                encoding="utf-8",
+            )
+            (home / "avoid-context-compaction.json").write_text(json.dumps({"hook_mode": "basic"}), encoding="utf-8")
             command = [sys.executable, str(INSTALLER), "--codex-home", str(home), "--with-hooks"]
             subprocess.run(command, check=True, capture_output=True, text=True)
             merged = json.loads((home / "hooks.json").read_text(encoding="utf-8"))
@@ -116,9 +121,25 @@ class ContextStateTests(unittest.TestCase):
             for event_name in ("SessionStart", "UserPromptSubmit", "PreCompact", "PostToolUse"):
                 self.assertNotIn(event_name, merged["hooks"])
             self.assertIn("Stop", merged["hooks"])
+            self.assertIn("context_continuity.py", str(merged["hooks"]["Stop"]))
+            self.assertTrue((home / "skills" / "context-continuity" / "SKILL.md").exists())
+            self.assertFalse((home / "skills" / "avoid-context-compaction" / "SKILL.md").exists())
+            compatibility_script = home / "skills" / "avoid-context-compaction" / "scripts" / "avoid_context_compaction.py"
+            self.assertTrue(compatibility_script.exists())
+            compatibility_env = dict(os.environ, CODEX_THREAD_ID="compatibility-session")
+            compatibility = subprocess.run(
+                [sys.executable, str(compatibility_script), "doctor", "--project", str(home)],
+                env=compatibility_env, capture_output=True, text=True,
+            )
+            self.assertEqual(compatibility.returncode, 0, compatibility.stderr)
+            self.assertIn('"enabled": false', compatibility.stdout)
+            preferences = json.loads((home / "context-continuity.json").read_text(encoding="utf-8"))
+            self.assertEqual(preferences["hook_mode"], "enhanced")
             agents = (home / "AGENTS.md").read_text(encoding="utf-8")
             self.assertIn("state_update_due", agents)
             self.assertNotIn("hard-stop", agents)
+            self.assertIn("context-continuity:basic-monitor:begin", agents)
+            self.assertNotIn("avoid-context-compaction:basic-monitor:begin", agents)
 
 
 if __name__ == "__main__":

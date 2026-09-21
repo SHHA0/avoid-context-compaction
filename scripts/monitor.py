@@ -8,16 +8,25 @@ import re
 import time
 from pathlib import Path
 
-import avoid_context_compaction as core
+import context_continuity as core
 
 
 EVENTS = ("Stop",)
-BASIC_BEGIN = "<!-- avoid-context-compaction:basic-monitor:begin -->"
-PREFERENCES_FILE = "avoid-context-compaction.json"
+BASIC_BEGIN = "<!-- context-continuity:basic-monitor:begin -->"
+PREFERENCES_FILE = "context-continuity.json"
+LEGACY_PREFERENCES_FILE = "avoid-context-compaction.json"
 
 
 def state_path(project, sid):
-    return Path(project).resolve() / core.DATA_DIR_NAME / core.safe_id(sid) / "monitor.json"
+    project = Path(project).resolve()
+    preferred = project / core.DATA_DIR_NAME / core.safe_id(sid) / "monitor.json"
+    if preferred.exists():
+        return preferred
+    for directory in core.LEGACY_DATA_DIR_NAMES:
+        legacy = project / directory / core.safe_id(sid) / "monitor.json"
+        if legacy.exists():
+            return legacy
+    return preferred
 
 
 def preferences_path(args):
@@ -73,13 +82,20 @@ def configured_events(args):
         config = json.loads(path.read_text(encoding="utf-8-sig"))
         if isinstance(config, dict) and isinstance(config.get("hooks"), dict):
             for event, groups in config["hooks"].items():
-                if isinstance(groups, list) and any("avoid_context_compaction.py" in str(group) for group in groups):
+                managed_names = ("context_continuity.py", "avoid_context_compaction.py", "context_guard.py")
+                if isinstance(groups, list) and any(
+                    any(name in str(group) for name in managed_names) for group in groups
+                ):
                     configured.append(event)
     return configured
 
 
 def load_preferences(args):
     path = preferences_path(args)
+    if not path.exists():
+        legacy = core.codex_home(args.codex_home) / LEGACY_PREFERENCES_FILE
+        if legacy.exists():
+            path = legacy
     if not path.exists():
         return {}
     value = json.loads(path.read_text(encoding="utf-8-sig"))
@@ -95,8 +111,8 @@ def hook_install_steps(args):
     return [
         f'Run: "{executable}" "{installer}" --codex-home "{home}" --with-hooks',
         "Restart Codex so the updated lifecycle Hook definitions are loaded.",
-        "Open /hooks, review the avoid-context-compaction handlers, and explicitly trust them.",
-        "Invoke $avoid-context-compaction, then run doctor and verify a real Stop event.",
+        "Open /hooks, review the context-continuity handler, and explicitly trust it.",
+        "Invoke $context-continuity, then run doctor and verify a real Stop event.",
     ]
 
 

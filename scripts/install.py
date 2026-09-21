@@ -15,10 +15,12 @@ from pathlib import Path
 
 EVENTS = ("Stop",)
 MANAGED_EVENTS = EVENTS + ("SessionStart", "UserPromptSubmit", "PreCompact", "PreToolUse", "PostToolUse")
-INSTALL_IGNORES = (".git", ".avoid-context-compaction", ".context-guard", "__pycache__", "*.pyc")
-BASIC_BEGIN = "<!-- avoid-context-compaction:basic-monitor:begin -->"
-BASIC_END = "<!-- avoid-context-compaction:basic-monitor:end -->"
-PREFERENCES_FILE = "avoid-context-compaction.json"
+INSTALL_IGNORES = (".git", ".context-continuity", ".avoid-context-compaction", ".context-guard", "__pycache__", "*.pyc")
+BASIC_BEGIN = "<!-- context-continuity:basic-monitor:begin -->"
+BASIC_END = "<!-- context-continuity:basic-monitor:end -->"
+LEGACY_BASIC_BLOCKS = (("<!-- avoid-context-compaction:basic-monitor:begin -->", "<!-- avoid-context-compaction:basic-monitor:end -->"),)
+PREFERENCES_FILE = "context-continuity.json"
+LEGACY_PREFERENCES_FILE = "avoid-context-compaction.json"
 
 
 def atomic_json(path: Path, value: object) -> None:
@@ -49,28 +51,28 @@ def atomic_text(path: Path, value: str) -> None:
 def install_basic_instructions(home: Path, executable: Path, script: Path) -> Path:
     path = home / "AGENTS.md"
     existing = path.read_text(encoding="utf-8-sig") if path.exists() else ""
-    start = existing.find(BASIC_BEGIN)
-    end = existing.find(BASIC_END)
-    if (start < 0) != (end < 0) or (start >= 0 and end < start):
-        raise ValueError(f"incomplete avoid-context-compaction block in {path}")
+    cleaned = existing
+    for begin, end_marker in ((BASIC_BEGIN, BASIC_END), *LEGACY_BASIC_BLOCKS):
+        while begin in cleaned or end_marker in cleaned:
+            start = cleaned.find(begin)
+            end = cleaned.find(end_marker)
+            if start < 0 or end < start:
+                raise ValueError(f"incomplete context-continuity block in {path}")
+            cleaned = cleaned[:start].rstrip() + cleaned[end + len(end_marker):]
     command = f'"{executable}" "{script}" final-check --project "<current-workspace-root>"'
     block = f"""{BASIC_BEGIN}
-## Avoid Context Compaction basic monitor
+## Context Continuity basic monitor
 
 For the main agent only, immediately before every final response:
 
 1. Run `{command}`, replacing `<current-workspace-root>` with the absolute workspace root for the active task.
-2. If the command reports `state_update_due: true`, follow the installed `$avoid-context-compaction` skill to write the factual task state, then run `final-check` again.
+2. If the command reports `state_update_due: true`, follow the installed `$context-continuity` skill to write the factual task state, then run `final-check` again.
 3. Append only the returned nonempty `footer` verbatim at the very end of the final response. Do not add threshold commentary or stop the task because of a context percentage.
 4. Generate a detailed handoff and copyable resume prompt only when the user explicitly requests one.
 
 If monitoring is not enabled for the current session/workspace, do nothing. Do not claim that lifecycle Hooks are running unless `doctor` reports an observed Stop event.
 {BASIC_END}"""
-    if start >= 0:
-        end += len(BASIC_END)
-        updated = existing[:start].rstrip() + "\n\n" + block + existing[end:]
-    else:
-        updated = existing.rstrip() + ("\n\n" if existing.strip() else "") + block + "\n"
+    updated = cleaned.rstrip() + ("\n\n" if cleaned.strip() else "") + block + "\n"
     atomic_text(path, updated)
     return path
 
@@ -80,7 +82,7 @@ def is_managed_group(group: object) -> bool:
         return False
     for handler in group.get("hooks", []):
         command = str(handler.get("command", "")) + str(handler.get("commandWindows", "")) if isinstance(handler, dict) else ""
-        if "avoid_context_compaction.py" in command or "context_guard.py" in command:
+        if any(name in command for name in ("context_continuity.py", "avoid_context_compaction.py", "context_guard.py")):
             return True
     return False
 
@@ -98,7 +100,8 @@ def main() -> int:
     args = parser.parse_args()
     source = Path(__file__).resolve().parents[1]
     home = Path(args.codex_home).expanduser().resolve()
-    target = home / "skills" / "avoid-context-compaction"
+    target = home / "skills" / "context-continuity"
+    compatibility_target = home / "skills" / "avoid-context-compaction"
     legacy_target = home / "skills" / "context-guard"
     hooks_path = home / "hooks.json"
 
@@ -110,7 +113,7 @@ def main() -> int:
         if target.exists():
             shutil.rmtree(target, onerror=remove_readonly)
         shutil.copytree(source, target, ignore=shutil.ignore_patterns(*INSTALL_IGNORES))
-    installed_script = target / "scripts" / "avoid_context_compaction.py"
+    installed_script = target / "scripts" / "context_continuity.py"
     executable = Path(sys.executable).resolve()
     agents_path = install_basic_instructions(home, executable, installed_script)
     if args.with_hooks:
@@ -146,17 +149,32 @@ def main() -> int:
                     handler["commandWindows"] = command_windows
         atomic_json(hooks_path, existing)
         preferences_path = home / PREFERENCES_FILE
-        preferences = json.loads(preferences_path.read_text(encoding="utf-8-sig")) if preferences_path.exists() else {}
+        legacy_preferences_path = home / LEGACY_PREFERENCES_FILE
+        source_preferences = preferences_path if preferences_path.exists() else legacy_preferences_path
+        preferences = json.loads(source_preferences.read_text(encoding="utf-8-sig")) if source_preferences.exists() else {}
         if not isinstance(preferences, dict):
             raise ValueError(f"unsupported preferences file structure: {preferences_path}")
         preferences.update(hook_mode="enhanced")
         atomic_json(preferences_path, preferences)
+    if compatibility_target.exists():
+        skills_root = (home / "skills").resolve()
+        if compatibility_target.resolve().parent != skills_root:
+            raise ValueError(f"refusing to replace unexpected compatibility path: {compatibility_target}")
+        shutil.rmtree(compatibility_target, onerror=remove_readonly)
+    compatibility_script = compatibility_target / "scripts" / "avoid_context_compaction.py"
+    atomic_text(compatibility_script, (
+        '"""Compatibility entry point for the renamed context-continuity skill."""\n'
+        "from pathlib import Path\nimport runpy\nimport sys\n\n"
+        "target = Path(__file__).resolve().parents[2] / 'context-continuity' / 'scripts' / 'context_continuity.py'\n"
+        "sys.path.insert(0, str(target.parent))\n"
+        "runpy.run_path(str(target), run_name='__main__')\n"
+    ))
     if legacy_target.exists():
         skills_root = (home / "skills").resolve()
         if legacy_target.resolve().parent != skills_root:
             raise ValueError(f"refusing to remove unexpected legacy path: {legacy_target}")
         shutil.rmtree(legacy_target)
-    print(json.dumps({"skill": str(target), "basic_instructions": str(agents_path),
+    print(json.dumps({"skill": str(target), "compatibility_script": str(compatibility_script), "basic_instructions": str(agents_path),
                       "hooks": str(hooks_path) if args.with_hooks else None,
                       "restart_required": True, "hook_trust_required": args.with_hooks}, ensure_ascii=False, indent=2))
     return 0

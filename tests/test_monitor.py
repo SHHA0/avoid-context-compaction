@@ -10,7 +10,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-core = importlib.import_module("avoid_context_compaction")
+core = importlib.import_module("context_continuity")
 monitor = importlib.import_module("monitor")
 
 
@@ -101,6 +101,14 @@ class MonitorTests(unittest.TestCase):
         for event in monitor.EVENTS:
             self.assertIsNone(self.hook(event))
         self.assertFalse((self.project / core.DATA_DIR_NAME).exists())
+
+    def test_legacy_session_state_remains_readable(self):
+        legacy_root = self.project / ".avoid-context-compaction" / "session-a"
+        legacy_root.mkdir(parents=True)
+        legacy_monitor = legacy_root / "monitor.json"
+        core.atomic_json(legacy_monitor, {"enabled": True})
+        self.assertEqual(monitor.state_path(self.project, "session-a"), legacy_monitor)
+        self.assertEqual(core.session_root(self.project, "session-a"), legacy_root)
 
     def test_activation_localizes_footer_and_never_stops_at_90_percent(self):
         self.append(.91)

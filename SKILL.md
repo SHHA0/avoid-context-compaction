@@ -1,9 +1,9 @@
 ---
-name: avoid-context-compaction
+name: context-continuity
 description: Report context usage at the end of each reply, preserve factual task state at 50% and 80% of each context cycle, and create a detailed handoff only when the user requests one.
 ---
 
-# Avoid Context Compaction
+# Context Continuity
 
 Use native context compaction to keep work running. This skill records recoverable task state; it never stops work because of a context percentage.
 
@@ -12,7 +12,7 @@ Use native context compaction to keep work running. This skill records recoverab
 When the user enables this skill, run:
 
 ```text
-python <skill>/scripts/avoid_context_compaction.py activate --project <absolute-session-project> --language <user-language-tag>
+python <skill>/scripts/context_continuity.py activate --project <absolute-session-project> --language <user-language-tag>
 ```
 
 Use the current `CODEX_THREAD_ID` or `CODEX_SESSION_ID`. Activation is scoped to this conversation and project. Reading or installing the skill does not activate it.
@@ -24,13 +24,13 @@ If `basic_instructions_configured` is false, explain that persistent basic monit
 Run:
 
 ```text
-python <skill>/scripts/avoid_context_compaction.py final-check --project <absolute-session-project>
+python <skill>/scripts/context_continuity.py final-check --project <absolute-session-project>
 ```
 
 If `state_update_due` is true, read [the task-state schema](references/checkpoints.md) and the existing `TASK_STATE.md` when present, collect factual state in the user's language, preserve still-valid earlier facts while applying later corrections, write it to a temporary JSON file, and run:
 
 ```text
-python <skill>/scripts/avoid_context_compaction.py state-update --input <json-file> --project <absolute-session-project>
+python <skill>/scripts/context_continuity.py state-update --input <json-file> --project <absolute-session-project>
 ```
 
 Then rerun `final-check`. Append only its nonempty `footer` verbatim as the final sentence of the reply. Do not mention threshold crossings, ask for a handoff, or pause the task because of usage.
@@ -42,14 +42,14 @@ The 50% and 80% thresholds apply once per context cycle. When usage jumps across
 An explicit request from the user to generate a handoff counts as consent. Run:
 
 ```text
-python <skill>/scripts/avoid_context_compaction.py decision --choice yes --project <absolute-session-project>
+python <skill>/scripts/context_continuity.py decision --choice yes --project <absolute-session-project>
 ```
 
 Next, locate the current conversation's `TASK_STATE.md` and `state.json`. Read both when they exist. Copy the exact `meta.saved_at` value from `state.json` into `base_state_saved_at`; use `null` only when no state file exists. Reconcile that saved state with everything that happened afterward, the current conversation, actual files, verification, running operations, and workspace state. Write a complete current snapshot using [the task-state schema](references/checkpoints.md), then run:
 
 ```text
-python <skill>/scripts/avoid_context_compaction.py state-refresh --input <json-file> --project <absolute-session-project>
-python <skill>/scripts/avoid_context_compaction.py handoff --project <absolute-session-project>
+python <skill>/scripts/context_continuity.py state-refresh --input <json-file> --project <absolute-session-project>
+python <skill>/scripts/context_continuity.py handoff --project <absolute-session-project>
 ```
 
 `state-refresh` rejects a stale or missing base timestamp, and `handoff` reads only the freshly written `state.json`; it does not accept a separate facts input. This captures work performed after the last 80% update. Read the generated `HANDOFF.md` and `RESUME.txt`, then provide clickable absolute links and the exact copyable resume prompt. Match the user's language. A handoff request authorizes one successful generation; a failed attempt may be retried. Never infer consent from a threshold, compaction, silence, or an unrelated request.
